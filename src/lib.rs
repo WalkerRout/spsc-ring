@@ -16,12 +16,8 @@ impl<T, const N: usize> Producer<'_, T, N> {
     self.inner.enqueue(elem)
   }
 
-  pub fn is_empty(&self) -> bool {
-    self.inner.is_empty()
-  }
-
   pub fn is_full(&self) -> bool {
-    self.inner.is_full()
+    is_full(self.inner)
   }
 }
 
@@ -37,11 +33,7 @@ impl<T, const N: usize> Consumer<'_, T, N> {
   }
 
   pub fn is_empty(&self) -> bool {
-    self.inner.is_empty()
-  }
-
-  pub fn is_full(&self) -> bool {
-    self.inner.is_full()
+    is_empty(self.inner)
   }
 }
 
@@ -86,11 +78,23 @@ const _: () = {
   }
 };
 
-#[repr(align(64))]
+// cache-aligned slots are an additive feature...
+#[cfg_attr(feature = "padded", repr(align(64)))]
 struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
 
 impl<T> Deref for Slot<T> {
   type Target = UnsafeCell<MaybeUninit<T>>;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> Deref for CachePadded<T> {
+  type Target = T;
 
   fn deref(&self) -> &Self::Target {
     &self.0
@@ -104,8 +108,8 @@ pub enum Error {
 }
 
 pub struct SpscRing<T, const N: usize> {
-  head: AtomicUsize,
-  tail: AtomicUsize,
+  head: CachePadded<AtomicUsize>,
+  tail: CachePadded<AtomicUsize>,
   ring: [Slot<T>; N],
 }
 
@@ -116,8 +120,8 @@ impl<T, const N: usize> SpscRing<T, N> {
   pub fn new() -> Self {
     let _ = Self::ASSERT_VALID_CAPACITY;
     Self {
-      head: AtomicUsize::new(0),
-      tail: AtomicUsize::new(0),
+      head: CachePadded(AtomicUsize::new(0)),
+      tail: CachePadded(AtomicUsize::new(0)),
       ring: array::from_fn(|_| Slot(UnsafeCell::new(MaybeUninit::uninit()))),
     }
   }
@@ -145,7 +149,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     if next_head != tail {
       // we stomp whatever used to be in that slot with a new entry...
       unsafe {
-        *self.ring[head].get() = MaybeUninit::new(elem);
+        (*self.ring[head].get()).write(elem);
       }
       self.head.store(next_head, Ordering::Release);
       Ok(())
@@ -170,20 +174,23 @@ impl<T, const N: usize> SpscRing<T, N> {
     Ok(elem)
   }
 
-  // unsynchronized, not for internal use
-  fn is_empty(&self) -> bool {
-    let head = self.head.load(Ordering::Relaxed);
-    let tail = self.tail.load(Ordering::Relaxed);
-    head == tail
-  }
+}
 
-  // unsychronized, not for internal use
-  fn is_full(&self) -> bool {
-    let tail = self.tail.load(Ordering::Relaxed);
-    let head = self.head.load(Ordering::Relaxed);
-    let next_head = (head + 1) % N;
-    next_head == tail
-  }
+// only meaningful when called by consumer (owns tail)
+fn is_empty<T, const N: usize>(ring: &SpscRing<T, N>) -> bool {
+  // synchronize-with producer
+  let head = ring.head.load(Ordering::Acquire);
+  let tail = ring.tail.load(Ordering::Relaxed);
+  head == tail
+}
+
+// only meaningful when called by producer (owns head)
+fn is_full<T, const N: usize>(ring: &SpscRing<T, N>) -> bool {
+  // synchronize-with consumer
+  let tail = ring.tail.load(Ordering::Acquire);
+  let head = ring.head.load(Ordering::Relaxed);
+  let next_head = (head + 1) % N;
+  next_head == tail
 }
 
 impl<T, const N: usize> Default for SpscRing<T, N> {

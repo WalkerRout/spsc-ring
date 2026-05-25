@@ -9,3 +9,7 @@ path = "examples/sequence.rs"
 
 [dependencies]
 thiserror = "2.0.18"
+
+[features]
+default = []
+padded = []
