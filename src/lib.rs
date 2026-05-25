@@ -6,6 +6,7 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // wrapper to enforce single producer constraint
+#[cfg_attr(feature = "padded-handles", repr(align(64)))]
 pub struct Producer<'r, T, const N: usize> {
   inner: &'r SpscRing<T, N>,
   // we can push until we hit head, so cache the latest goal post, and when we
@@ -28,6 +29,7 @@ impl<T, const N: usize> Producer<'_, T, N> {
 }
 
 // wrapper to enforce single consumer constraint
+#[cfg_attr(feature = "padded-handles", repr(align(64)))]
 pub struct Consumer<'r, T, const N: usize> {
   inner: &'r SpscRing<T, N>,
   // same shit as producer
@@ -90,7 +92,7 @@ const _: () = {
 };
 
 // cache-aligned slots are an additive feature...
-#[cfg_attr(feature = "padded", repr(align(64)))]
+#[cfg_attr(feature = "padded-slots", repr(align(64)))]
 struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
 
 impl<T> Deref for Slot<T> {

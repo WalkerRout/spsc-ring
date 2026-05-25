@@ -7,9 +7,17 @@ edition = "2024"
 name = "sequence"
 path = "examples/sequence.rs"
 
+[[bench]]
+name = "spsc"
+harness = false
+
 [dependencies]
 thiserror = "2.0.18"
 
+[dev-dependencies]
+criterion = "0.5"
+
 [features]
 default = []
-padded = []
+padded-slots = []
+padded-handles = []
