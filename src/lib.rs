@@ -1,8 +1,16 @@
-use std::cell::{Cell, UnsafeCell};
-use std::marker::PhantomData;
-use std::mem::{self, MaybeUninit};
-use std::ops::{Deref, Index};
-use std::sync::atomic::{AtomicUsize, Ordering};
+#![no_std]
+
+#[cfg(feature = "heap")]
+extern crate alloc;
+
+#[cfg(feature = "heap")]
+use alloc::{boxed::Box, vec::Vec};
+
+use core::cell::{Cell, UnsafeCell};
+use core::marker::PhantomData;
+use core::mem::{self, MaybeUninit};
+use core::ops::{Deref, Index};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 // wrapper to enforce single producer constraint
 #[cfg_attr(feature = "padded-handles", repr(align(64)))]
@@ -90,19 +98,78 @@ const _: () = {
   }
 };
 
-// cache-aligned slots are an additive feature...
-#[cfg_attr(feature = "padded-slots", repr(align(64)))]
+#[cfg(feature = "padded-slots")]
+struct Slot<T>(CachePadded<UnsafeCell<MaybeUninit<T>>>);
+
+#[cfg(not(feature = "padded-slots"))]
 struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
+
+impl<T> Slot<T> {
+  fn new() -> Self {
+    #[cfg(feature = "padded-slots")]
+    return Self(CachePadded(UnsafeCell::new(MaybeUninit::uninit())));
+    #[cfg(not(feature = "padded-slots"))]
+    return Self(UnsafeCell::new(MaybeUninit::uninit()));
+  }
+}
 
 impl<T> Deref for Slot<T> {
   type Target = UnsafeCell<MaybeUninit<T>>;
 
   fn deref(&self) -> &Self::Target {
-    &self.0
+    // lol
+    #[cfg(feature = "padded-slots")]
+    return &self.0.0;
+    #[cfg(not(feature = "padded-slots"))]
+    return &self.0;
   }
 }
 
-#[repr(align(64))]
+// ripped all of these cfg_attrs directly from crossbeam_utils/cache_padded.rs
+// - https://docs.rs/crossbeam-utils/latest/src/crossbeam_utils/cache_padded.rs.html#63
+#[cfg_attr(
+  any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "arm64ec",
+    target_arch = "powerpc64",
+  ),
+  repr(align(128))
+)]
+#[cfg_attr(
+    any(
+        target_arch = "arm",
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        // we include xtensa for all my old esp32s...
+        target_arch = "xtensa",
+        target_arch = "sparc",
+        target_arch = "hexagon",
+    ),
+    repr(align(32))
+)]
+#[cfg_attr(target_arch = "m68k", repr(align(16)))]
+#[cfg_attr(target_arch = "s390x", repr(align(256)))]
+#[cfg_attr(
+  not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "arm64ec",
+    target_arch = "powerpc64",
+    target_arch = "arm",
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    target_arch = "sparc",
+    target_arch = "hexagon",
+    target_arch = "m68k",
+    target_arch = "s390x",
+  )),
+  repr(align(64))
+)]
 struct CachePadded<T>(T);
 
 impl<T> Deref for CachePadded<T> {
@@ -139,14 +206,14 @@ impl<T, const N: usize> Ring<T, N> {
     // use stack-backed memory without heap feature
     #[cfg(not(feature = "heap"))]
     let slots = {
-      use std::array;
-      array::from_fn(|_| Slot(UnsafeCell::new(MaybeUninit::uninit())))
+      use core::array;
+      array::from_fn(|_| Slot::new())
     };
 
     // we just box slots on heap when we have access to alloc
     #[cfg(feature = "heap")]
     let slots: Box<[Slot<T>; N]> = (0..N)
-      .map(|_| Slot(UnsafeCell::new(MaybeUninit::uninit())))
+      .map(|_| Slot::new())
       .collect::<Vec<_>>()
       .into_boxed_slice()
       .try_into()

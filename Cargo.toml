@@ -16,7 +16,7 @@ name = "multi_thread"
 harness = false
 
 [dependencies]
-thiserror = "2.0.18"
+thiserror = { version = "2.0.18", default-features = false }
 
 [dev-dependencies]
 criterion = "0.5"
