@@ -244,7 +244,15 @@ impl<T, const N: usize> Default for SpscRing<T, N> {
 impl<T, const N: usize> Drop for SpscRing<T, N> {
   fn drop(&mut self) {
     if mem::needs_drop::<T>() {
-      todo!()
+      // tail is racing to catch up to head
+      let mut tail = self.tail.load(Ordering::Relaxed);
+      let head = self.head.load(Ordering::Relaxed);
+      while tail != head {
+        unsafe {
+          (*self.ring[tail & (N - 1)].get()).assume_init_drop();
+        }
+        tail = step::<N>(tail);
+      }
     }
   }
 }
