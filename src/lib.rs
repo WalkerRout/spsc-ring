@@ -110,8 +110,11 @@ pub struct SpscRing<T, const N: usize> {
 }
 
 impl<T, const N: usize> SpscRing<T, N> {
+  const ASSERT_VALID_CAPACITY: () = assert!(N >= 2, "spsc ring must have size >=2");
+
   #[must_use]
   pub fn new() -> Self {
+    let _ = Self::ASSERT_VALID_CAPACITY;
     Self {
       head: AtomicUsize::new(0),
       tail: AtomicUsize::new(0),
