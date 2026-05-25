@@ -137,7 +137,7 @@ impl<T, const N: usize> SpscRing<T, N> {
   #[must_use]
   #[inline]
   pub fn new() -> Self {
-    let _ = Self::ASSERT_VALID_CAPACITY;
+    let () = Self::ASSERT_VALID_CAPACITY;
     Self {
       head: CachePadded(AtomicUsize::new(0)),
       tail: CachePadded(AtomicUsize::new(0)),
@@ -178,7 +178,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     // safety; we stomp whatever used to be in that slot with a new entry, and every
     // slot is initialized...
     unsafe {
-      (*self.ring[head&(N-1)].get()).write(elem);
+      (*self.ring[head & (N - 1)].get()).write(elem);
     }
     self.head.store(next_head, Ordering::Release);
     Ok(())
@@ -204,7 +204,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     }
     // safety; previous tail slot is treated as garbage after we step the tail, so
     // we can claim sole ownership of the contained element
-    let elem = unsafe { (*self.ring[tail&(N-1)].get()).assume_init_read() };
+    let elem = unsafe { (*self.ring[tail & (N - 1)].get()).assume_init_read() };
     let next_tail = step::<N>(tail);
     self.tail.store(next_tail, Ordering::Release);
     Ok(elem)
