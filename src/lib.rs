@@ -1,8 +1,7 @@
-use std::array;
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
-use std::ops::Deref;
+use std::ops::{Deref, Index};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // wrapper to enforce single producer constraint
@@ -120,28 +119,69 @@ pub enum Error {
   QueueIsEmpty,
 }
 
+struct Ring<T, const N: usize> {
+  #[cfg(not(feature = "heap"))]
+  slots: [Slot<T>; N],
+  #[cfg(feature = "heap")]
+  slots: Box<[Slot<T>; N]>,
+}
+
+impl<T, const N: usize> Ring<T, N> {
+  const ASSERT_VALID_CAPACITY: () = assert!(
+    N >= 2 && N.is_power_of_two(),
+    "ring must have size >=2 for power of two N"
+  );
+
+  #[inline]
+  fn new() -> Self {
+    let () = Self::ASSERT_VALID_CAPACITY;
+
+    // use stack-backed memory without heap feature
+    #[cfg(not(feature = "heap"))]
+    let slots = {
+      use std::array;
+      array::from_fn(|_| Slot(UnsafeCell::new(MaybeUninit::uninit())))
+    };
+
+    // we just box slots on heap when we have access to alloc
+    #[cfg(feature = "heap")]
+    let slots: Box<[Slot<T>; N]> = (0..N)
+      .map(|_| Slot(UnsafeCell::new(MaybeUninit::uninit())))
+      .collect::<Vec<_>>()
+      .into_boxed_slice()
+      .try_into()
+      .ok()
+      .unwrap();
+
+    Self { slots }
+  }
+}
+
+impl<T, const N: usize> Index<usize> for Ring<T, N> {
+  type Output = Slot<T>;
+
+  #[inline(always)]
+  fn index(&self, i: usize) -> &Slot<T> {
+    &self.slots[i & (N - 1)]
+  }
+}
+
 /// Lock-free, single-producer single-consumer ring buffer
 /// - contains N-1 available slots, SpscRing<T, 16>
 pub struct SpscRing<T, const N: usize> {
   head: CachePadded<AtomicUsize>,
   tail: CachePadded<AtomicUsize>,
-  ring: [Slot<T>; N],
+  ring: Ring<T, N>,
 }
 
 impl<T, const N: usize> SpscRing<T, N> {
-  const ASSERT_VALID_CAPACITY: () = assert!(
-    N >= 2 && N.is_power_of_two(),
-    "spsc ring must have size >=2 for power of two N"
-  );
-
   #[must_use]
   #[inline]
   pub fn new() -> Self {
-    let () = Self::ASSERT_VALID_CAPACITY;
     Self {
       head: CachePadded(AtomicUsize::new(0)),
       tail: CachePadded(AtomicUsize::new(0)),
-      ring: array::from_fn(|_| Slot(UnsafeCell::new(MaybeUninit::uninit()))),
+      ring: Ring::new(),
     }
   }
 
@@ -178,7 +218,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     // safety; we stomp whatever used to be in that slot with a new entry, and every
     // slot is initialized...
     unsafe {
-      (*self.ring[head & (N - 1)].get()).write(elem);
+      (*self.ring[head].get()).write(elem);
     }
     self.head.store(next_head, Ordering::Release);
     Ok(())
@@ -204,7 +244,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     }
     // safety; previous tail slot is treated as garbage after we step the tail, so
     // we can claim sole ownership of the contained element
-    let elem = unsafe { (*self.ring[tail & (N - 1)].get()).assume_init_read() };
+    let elem = unsafe { (*self.ring[tail].get()).assume_init_read() };
     let next_tail = step::<N>(tail);
     self.tail.store(next_tail, Ordering::Release);
     Ok(elem)
@@ -248,8 +288,9 @@ impl<T, const N: usize> Drop for SpscRing<T, N> {
       let mut tail = self.tail.load(Ordering::Relaxed);
       let head = self.head.load(Ordering::Relaxed);
       while tail != head {
+        // safety; all elements between tail and head are uniquely owned and live
         unsafe {
-          (*self.ring[tail & (N - 1)].get()).assume_init_drop();
+          (*self.ring[tail].get()).assume_init_drop();
         }
         tail = step::<N>(tail);
       }
