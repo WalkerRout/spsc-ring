@@ -1,0 +1,11 @@
+[package]
+name = "lib-spsc-ring"
+version = "0.1.0"
+edition = "2024"
+
+[[example]]
+name = "sequence"
+path = "examples/sequence.rs"
+
+[dependencies]
+thiserror = "2.0.18"
