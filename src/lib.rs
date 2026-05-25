@@ -1,21 +1,19 @@
 #![no_std]
 
+use core::cell::{Cell, UnsafeCell};
+use core::marker::PhantomData;
+use core::mem::{self, MaybeUninit};
+use core::ops::{Deref, DerefMut, Index};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 #[cfg(feature = "heap")]
 extern crate alloc;
 
 #[cfg(feature = "heap")]
 use alloc::{boxed::Box, vec::Vec};
 
-use core::cell::{Cell, UnsafeCell};
-use core::marker::PhantomData;
-use core::mem::{self, MaybeUninit};
-use core::ops::{Deref, Index};
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-// wrapper to enforce single producer constraint
-#[cfg_attr(feature = "padded-handles", repr(align(64)))]
-pub struct Producer<'r, T, const N: usize> {
-  inner: &'r SpscRing<T, N>,
+struct ProducerInner<'r, T, const N: usize> {
+  ring: &'r SpscRing<T, N>,
   // we can push until we hit head, so cache the latest goal post, and when we
   // hit it, we can reload to see if its moved...
   cached_tail: usize,
@@ -23,37 +21,59 @@ pub struct Producer<'r, T, const N: usize> {
   _unsync: PhantomData<Cell<()>>,
 }
 
+// wrapper to enforce single producer constraint
+pub struct Producer<'r, T, const N: usize> {
+  #[cfg(feature = "padded-handles")]
+  inner: CachePadded<ProducerInner<'r, T, N>>,
+  #[cfg(not(feature = "padded-handles"))]
+  inner: ProducerInner<'r, T, N>,
+}
+
 impl<T, const N: usize> Producer<'_, T, N> {
   #[inline(always)]
   pub fn enqueue(&mut self, elem: T) -> Result<(), T> {
-    self.inner.enqueue(elem, &mut self.cached_tail)
+    #[cfg(feature = "padded-handles")]
+    let inner = &mut *self.inner;
+    #[cfg(not(feature = "padded-handles"))]
+    let inner = &mut self.inner;
+    inner.ring.enqueue(elem, &mut inner.cached_tail)
   }
 
   #[inline(always)]
   pub fn is_full(&self) -> bool {
-    is_full(self.inner)
+    is_full(self.inner.ring)
   }
 }
 
-// wrapper to enforce single consumer constraint
-#[cfg_attr(feature = "padded-handles", repr(align(64)))]
-pub struct Consumer<'r, T, const N: usize> {
-  inner: &'r SpscRing<T, N>,
+struct ConsumerInner<'r, T, const N: usize> {
+  ring: &'r SpscRing<T, N>,
   // same shit as producer
   cached_head: usize,
   // enforce !Sync
   _unsync: PhantomData<Cell<()>>,
 }
 
+// wrapper to enforce single consumer constraint
+pub struct Consumer<'r, T, const N: usize> {
+  #[cfg(feature = "padded-handles")]
+  inner: CachePadded<ConsumerInner<'r, T, N>>,
+  #[cfg(not(feature = "padded-handles"))]
+  inner: ConsumerInner<'r, T, N>,
+}
+
 impl<T, const N: usize> Consumer<'_, T, N> {
   #[inline(always)]
   pub fn dequeue(&mut self) -> Result<T, Error> {
-    self.inner.dequeue(&mut self.cached_head)
+    #[cfg(feature = "padded-handles")]
+    let inner = &mut *self.inner;
+    #[cfg(not(feature = "padded-handles"))]
+    let inner = &mut self.inner;
+    inner.ring.dequeue(&mut inner.cached_head)
   }
 
   #[inline(always)]
   pub fn is_empty(&self) -> bool {
-    is_empty(self.inner)
+    is_empty(self.inner.ring)
   }
 }
 
@@ -107,9 +127,13 @@ struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
 impl<T> Slot<T> {
   fn new() -> Self {
     #[cfg(feature = "padded-slots")]
-    return Self(CachePadded(UnsafeCell::new(MaybeUninit::uninit())));
+    {
+      Self(CachePadded(UnsafeCell::new(MaybeUninit::uninit())))
+    }
     #[cfg(not(feature = "padded-slots"))]
-    return Self(UnsafeCell::new(MaybeUninit::uninit()));
+    {
+      Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
   }
 }
 
@@ -119,9 +143,13 @@ impl<T> Deref for Slot<T> {
   fn deref(&self) -> &Self::Target {
     // lol
     #[cfg(feature = "padded-slots")]
-    return &self.0.0;
+    {
+      &self.0.0
+    }
     #[cfg(not(feature = "padded-slots"))]
-    return &self.0;
+    {
+      &self.0
+    }
   }
 }
 
@@ -137,18 +165,18 @@ impl<T> Deref for Slot<T> {
   repr(align(128))
 )]
 #[cfg_attr(
-    any(
-        target_arch = "arm",
-        target_arch = "mips",
-        target_arch = "mips32r6",
-        target_arch = "mips64",
-        target_arch = "mips64r6",
-        // we include xtensa for all my old esp32s...
-        target_arch = "xtensa",
-        target_arch = "sparc",
-        target_arch = "hexagon",
-    ),
-    repr(align(32))
+  any(
+    target_arch = "arm",
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6",
+    // include xtensa for esp32 projects...
+    target_arch = "xtensa",
+    target_arch = "sparc",
+    target_arch = "hexagon",
+  ),
+  repr(align(32))
 )]
 #[cfg_attr(target_arch = "m68k", repr(align(16)))]
 #[cfg_attr(target_arch = "s390x", repr(align(256)))]
@@ -180,6 +208,12 @@ impl<T> Deref for CachePadded<T> {
   }
 }
 
+impl<T> DerefMut for CachePadded<T> {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.0
+  }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
   #[error("spsc ring queue is empty")]
@@ -187,10 +221,10 @@ pub enum Error {
 }
 
 struct Ring<T, const N: usize> {
-  #[cfg(not(feature = "heap"))]
-  slots: [Slot<T>; N],
   #[cfg(feature = "heap")]
   slots: Box<[Slot<T>; N]>,
+  #[cfg(not(feature = "heap"))]
+  slots: [Slot<T>; N],
 }
 
 impl<T, const N: usize> Ring<T, N> {
@@ -202,24 +236,23 @@ impl<T, const N: usize> Ring<T, N> {
   #[inline]
   fn new() -> Self {
     let () = Self::ASSERT_VALID_CAPACITY;
-
+    // we just box slots on heap when we have access to alloc
+    #[cfg(feature = "heap")]
+    let slots = {
+      (0..N)
+        .map(|_| Slot::new())
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+        .try_into()
+        .ok()
+        .unwrap()
+    };
     // use stack-backed memory without heap feature
     #[cfg(not(feature = "heap"))]
     let slots = {
       use core::array;
       array::from_fn(|_| Slot::new())
     };
-
-    // we just box slots on heap when we have access to alloc
-    #[cfg(feature = "heap")]
-    let slots: Box<[Slot<T>; N]> = (0..N)
-      .map(|_| Slot::new())
-      .collect::<Vec<_>>()
-      .into_boxed_slice()
-      .try_into()
-      .ok()
-      .unwrap();
-
     Self { slots }
   }
 }
@@ -254,15 +287,27 @@ impl<T, const N: usize> SpscRing<T, N> {
 
   #[inline]
   pub fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
-    let producer = Producer {
-      inner: self,
-      cached_tail: 0,
+    let pinner = ProducerInner {
+      ring: self,
+      cached_tail: self.tail.load(Ordering::Relaxed),
       _unsync: PhantomData,
     };
-    let consumer = Consumer {
-      inner: self,
-      cached_head: 0,
+    let cinner = ConsumerInner {
+      ring: self,
+      cached_head: self.head.load(Ordering::Relaxed),
       _unsync: PhantomData,
+    };
+    let producer = Producer {
+      #[cfg(feature = "padded-handles")]
+      inner: CachePadded(pinner),
+      #[cfg(not(feature = "padded-handles"))]
+      inner: pinner,
+    };
+    let consumer = Consumer {
+      #[cfg(feature = "padded-handles")]
+      inner: CachePadded(cinner),
+      #[cfg(not(feature = "padded-handles"))]
+      inner: cinner,
     };
     (producer, consumer)
   }
