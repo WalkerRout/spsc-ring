@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // wrapper to enforce single producer constraint
 pub struct Producer<'r, T, const N: usize> {
   inner: &'r SpscRing<T, N>,
+  // we can push until we hit head, so cache the latest goal post, and when we
+  // hit it, we can reload to see if its moved...
+  cached_tail: usize,
   // enforce !Sync
   _unsync: PhantomData<Cell<()>>,
 }
@@ -15,7 +18,7 @@ pub struct Producer<'r, T, const N: usize> {
 impl<T, const N: usize> Producer<'_, T, N> {
   #[inline(always)]
   pub fn enqueue(&mut self, elem: T) -> Result<(), T> {
-    self.inner.enqueue(elem)
+    self.inner.enqueue(elem, &mut self.cached_tail)
   }
 
   #[inline(always)]
@@ -27,6 +30,8 @@ impl<T, const N: usize> Producer<'_, T, N> {
 // wrapper to enforce single consumer constraint
 pub struct Consumer<'r, T, const N: usize> {
   inner: &'r SpscRing<T, N>,
+  // same shit as producer
+  cached_head: usize,
   // enforce !Sync
   _unsync: PhantomData<Cell<()>>,
 }
@@ -34,7 +39,7 @@ pub struct Consumer<'r, T, const N: usize> {
 impl<T, const N: usize> Consumer<'_, T, N> {
   #[inline(always)]
   pub fn dequeue(&mut self) -> Result<T, Error> {
-    self.inner.dequeue()
+    self.inner.dequeue(&mut self.cached_head)
   }
 
   #[inline(always)]
@@ -142,47 +147,61 @@ impl<T, const N: usize> SpscRing<T, N> {
   pub fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
     let producer = Producer {
       inner: self,
+      cached_tail: 0,
       _unsync: PhantomData,
     };
     let consumer = Consumer {
       inner: self,
+      cached_head: 0,
       _unsync: PhantomData,
     };
     (producer, consumer)
   }
 
   // head is owned by the producer
+  // - cached_tail is refreshed when head catches back around to tail... this means
+  //   the queue is full, and we need to check to see if the tail has moved forward
   #[inline]
-  fn enqueue(&self, elem: T) -> Result<(), T> {
-    // producer is the only writer of head
-    // - this thread reads it own writes...
+  fn enqueue(&self, elem: T, cached_tail: &mut usize) -> Result<(), T> {
+    // producer owns head, we are reading our own writes...
     let head = self.head.load(Ordering::Relaxed);
-    // synchronize-with consumer
-    let tail = self.tail.load(Ordering::Acquire);
     let next_head = step::<N>(head);
-    if next_head != tail {
-      // we stomp whatever used to be in that slot with a new entry...
-      unsafe {
-        (*self.ring[head&(N-1)].get()).write(elem);
+    if next_head == *cached_tail {
+      // synchronize-with consumer
+      *cached_tail = self.tail.load(Ordering::Acquire);
+      if next_head == *cached_tail {
+        return Err(elem);
       }
-      self.head.store(next_head, Ordering::Release);
-      Ok(())
-    } else {
-      Err(elem)
     }
+    // safety; we stomp whatever used to be in that slot with a new entry, and every
+    // slot is initialized...
+    unsafe {
+      (*self.ring[head&(N-1)].get()).write(elem);
+    }
+    self.head.store(next_head, Ordering::Release);
+    Ok(())
   }
 
-  // tail is owned by the consumer
+  // tail is owned by consumer
+  // - cached_head is refreshed when tail catches up to head (its empty), to see if
+  //   anything else was added in the meantime...
   // - wanted signature to be -> Result<T, ()> but clippy got mad
   #[inline]
-  fn dequeue(&self) -> Result<T, Error> {
-    // synchronize-with producer
-    let head = self.head.load(Ordering::Acquire);
-    // same thing as producer, consumer is just reading its writes on tail...
+  fn dequeue(&self, cached_head: &mut usize) -> Result<T, Error> {
+    // consumer owns tail, again we are reading our own writes
     let tail = self.tail.load(Ordering::Relaxed);
-    if head == tail {
-      return Err(Error::QueueIsEmpty);
+    // did we catch up to the head?
+    if tail == *cached_head {
+      // yup, synchronize-with producer
+      *cached_head = self.head.load(Ordering::Acquire);
+      // has the head moved?
+      if tail == *cached_head {
+        // nope still empty
+        return Err(Error::QueueIsEmpty);
+      }
     }
+    // safety; previous tail slot is treated as garbage after we step the tail, so
+    // we can claim sole ownership of the contained element
     let elem = unsafe { (*self.ring[tail&(N-1)].get()).assume_init_read() };
     let next_tail = step::<N>(tail);
     self.tail.store(next_tail, Ordering::Release);
