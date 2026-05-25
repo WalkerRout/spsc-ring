@@ -5,6 +5,7 @@ use std::mem::{self, MaybeUninit};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// wrapper to enforce single producer constraint
 pub struct Producer<'r, T, const N: usize> {
   inner: &'r SpscRing<T, N>,
   // enforce !Sync
@@ -12,15 +13,18 @@ pub struct Producer<'r, T, const N: usize> {
 }
 
 impl<T, const N: usize> Producer<'_, T, N> {
+  #[inline(always)]
   pub fn enqueue(&mut self, elem: T) -> Result<(), T> {
     self.inner.enqueue(elem)
   }
 
+  #[inline(always)]
   pub fn is_full(&self) -> bool {
     is_full(self.inner)
   }
 }
 
+// wrapper to enforce single consumer constraint
 pub struct Consumer<'r, T, const N: usize> {
   inner: &'r SpscRing<T, N>,
   // enforce !Sync
@@ -28,10 +32,12 @@ pub struct Consumer<'r, T, const N: usize> {
 }
 
 impl<T, const N: usize> Consumer<'_, T, N> {
+  #[inline(always)]
   pub fn dequeue(&mut self) -> Result<T, Error> {
     self.inner.dequeue()
   }
 
+  #[inline(always)]
   pub fn is_empty(&self) -> bool {
     is_empty(self.inner)
   }
@@ -107,6 +113,8 @@ pub enum Error {
   QueueIsEmpty,
 }
 
+/// Lock-free, single-producer single-consumer ring buffer
+/// - contains N-1 available slots, SpscRing<T, 16>
 pub struct SpscRing<T, const N: usize> {
   head: CachePadded<AtomicUsize>,
   tail: CachePadded<AtomicUsize>,
@@ -114,9 +122,13 @@ pub struct SpscRing<T, const N: usize> {
 }
 
 impl<T, const N: usize> SpscRing<T, N> {
-  const ASSERT_VALID_CAPACITY: () = assert!(N >= 2, "spsc ring must have size >=2");
+  const ASSERT_VALID_CAPACITY: () = assert!(
+    N >= 2 && N.is_power_of_two(),
+    "spsc ring must have size >=2 for power of two N"
+  );
 
   #[must_use]
+  #[inline]
   pub fn new() -> Self {
     let _ = Self::ASSERT_VALID_CAPACITY;
     Self {
@@ -126,6 +138,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     }
   }
 
+  #[inline]
   pub fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
     let producer = Producer {
       inner: self,
@@ -139,13 +152,14 @@ impl<T, const N: usize> SpscRing<T, N> {
   }
 
   // head is owned by the producer
+  #[inline]
   fn enqueue(&self, elem: T) -> Result<(), T> {
     // producer is the only writer of head
     // - this thread reads it own writes...
     let head = self.head.load(Ordering::Relaxed);
     // synchronize-with consumer
     let tail = self.tail.load(Ordering::Acquire);
-    let next_head = (head + 1) % N;
+    let next_head = step::<N>(head);
     if next_head != tail {
       // we stomp whatever used to be in that slot with a new entry...
       unsafe {
@@ -160,6 +174,7 @@ impl<T, const N: usize> SpscRing<T, N> {
 
   // tail is owned by the consumer
   // - wanted signature to be -> Result<T, ()> but clippy got mad
+  #[inline]
   fn dequeue(&self) -> Result<T, Error> {
     // synchronize-with producer
     let head = self.head.load(Ordering::Acquire);
@@ -169,14 +184,14 @@ impl<T, const N: usize> SpscRing<T, N> {
       return Err(Error::QueueIsEmpty);
     }
     let elem = unsafe { (*self.ring[tail].get()).assume_init_read() };
-    let next_tail = (tail + 1) % N;
+    let next_tail = step::<N>(tail);
     self.tail.store(next_tail, Ordering::Release);
     Ok(elem)
   }
-
 }
 
 // only meaningful when called by consumer (owns tail)
+#[inline(always)]
 fn is_empty<T, const N: usize>(ring: &SpscRing<T, N>) -> bool {
   // synchronize-with producer
   let head = ring.head.load(Ordering::Acquire);
@@ -185,12 +200,18 @@ fn is_empty<T, const N: usize>(ring: &SpscRing<T, N>) -> bool {
 }
 
 // only meaningful when called by producer (owns head)
+#[inline(always)]
 fn is_full<T, const N: usize>(ring: &SpscRing<T, N>) -> bool {
   // synchronize-with consumer
   let tail = ring.tail.load(Ordering::Acquire);
   let head = ring.head.load(Ordering::Relaxed);
-  let next_head = (head + 1) % N;
+  let next_head = step::<N>(head);
   next_head == tail
+}
+
+#[inline(always)]
+fn step<const N: usize>(i: usize) -> usize {
+  (i + 1) & (N - 1)
 }
 
 impl<T, const N: usize> Default for SpscRing<T, N> {
