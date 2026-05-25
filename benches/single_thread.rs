@@ -1,52 +1,62 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::time::{Duration, Instant};
 
 use criterion::measurement::WallTime;
 use criterion::{
-  AxisScale, BenchmarkGroup, BenchmarkId, Criterion, PlotConfiguration, black_box, criterion_group,
+  AxisScale, BenchmarkGroup, BenchmarkId, Criterion, PlotConfiguration, criterion_group,
   criterion_main,
 };
 use lib_spsc_ring::SpscRing;
 
 fn run_enqueue<const N: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-  let ring: &'static mut SpscRing<u32, N> = Box::leak(Box::new(SpscRing::new()));
-  let (mut producer, mut consumer) = ring.split();
-
-  let stop = Arc::new(AtomicBool::new(false));
-  let stop_drainer = stop.clone();
-  let drainer = thread::spawn(move || {
-    while !stop_drainer.load(Ordering::Relaxed) {
-      let _ = consumer.dequeue();
-    }
-  });
-
   group.bench_function(BenchmarkId::from_parameter(N), |b| {
-    b.iter(|| producer.enqueue(black_box(0u32)));
-  });
+    let ring: &'static mut SpscRing<u32, N> = Box::leak(Box::new(SpscRing::new()));
+    let (mut producer, mut consumer) = ring.split();
+    let cap = (N - 1) as u64;
 
-  stop.store(true, Ordering::Relaxed);
-  drainer.join().unwrap();
+    b.iter_custom(|iters| {
+      let mut total = Duration::ZERO;
+      let mut done = 0u64;
+      while done < iters {
+        let chunk = cap.min(iters - done);
+
+        let start = Instant::now();
+        for _ in 0..chunk {
+          let _ = producer.enqueue(0u32);
+        }
+        total += start.elapsed();
+        done += chunk;
+
+        while consumer.dequeue().is_ok() {}
+      }
+      total
+    });
+  });
 }
 
 fn run_dequeue<const N: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
-  let ring: &'static mut SpscRing<u32, N> = Box::leak(Box::new(SpscRing::new()));
-  let (mut producer, mut consumer) = ring.split();
-
-  let stop = Arc::new(AtomicBool::new(false));
-  let stop_filler = stop.clone();
-  let filler = thread::spawn(move || {
-    while !stop_filler.load(Ordering::Relaxed) {
-      let _ = producer.enqueue(0u32);
-    }
-  });
-
   group.bench_function(BenchmarkId::from_parameter(N), |b| {
-    b.iter(|| consumer.dequeue());
-  });
+    let ring: &'static mut SpscRing<u32, N> = Box::leak(Box::new(SpscRing::new()));
+    let (mut producer, mut consumer) = ring.split();
+    let cap = (N - 1) as u64;
 
-  stop.store(true, Ordering::Relaxed);
-  filler.join().unwrap();
+    b.iter_custom(|iters| {
+      let mut total = Duration::ZERO;
+      let mut done = 0u64;
+      while done < iters {
+        while producer.enqueue(0u32).is_ok() {}
+
+        let chunk = cap.min(iters - done);
+
+        let start = Instant::now();
+        for _ in 0..chunk {
+          let _ = consumer.dequeue();
+        }
+        total += start.elapsed();
+        done += chunk;
+      }
+      total
+    });
+  });
 }
 
 fn bench_enqueue(c: &mut Criterion) {

@@ -8,7 +8,11 @@ name = "sequence"
 path = "examples/sequence.rs"
 
 [[bench]]
-name = "spsc"
+name = "single_thread"
+harness = false
+
+[[bench]]
+name = "multi_thread"
 harness = false
 
 [dependencies]
