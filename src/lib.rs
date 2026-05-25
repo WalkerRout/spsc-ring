@@ -163,7 +163,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     if next_head != tail {
       // we stomp whatever used to be in that slot with a new entry...
       unsafe {
-        (*self.ring[head].get()).write(elem);
+        (*self.ring[head&(N-1)].get()).write(elem);
       }
       self.head.store(next_head, Ordering::Release);
       Ok(())
@@ -183,7 +183,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     if head == tail {
       return Err(Error::QueueIsEmpty);
     }
-    let elem = unsafe { (*self.ring[tail].get()).assume_init_read() };
+    let elem = unsafe { (*self.ring[tail&(N-1)].get()).assume_init_read() };
     let next_tail = step::<N>(tail);
     self.tail.store(next_tail, Ordering::Release);
     Ok(elem)
