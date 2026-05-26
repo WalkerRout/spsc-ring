@@ -3,6 +3,10 @@ name: test
 on:
   push:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   RUST_BACKTRACE: full
   CARGO_TERM_COLOR: always

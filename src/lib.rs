@@ -911,8 +911,7 @@ mod tests {
       for _ in 0..3 {
         p.enqueue(DropCounter).unwrap();
       }
-      let mut buf: [MaybeUninit<DropCounter>; 3] =
-        unsafe { MaybeUninit::uninit().assume_init() };
+      let mut buf: [MaybeUninit<DropCounter>; 3] = unsafe { MaybeUninit::uninit().assume_init() };
       let d = c.dequeue_batch(&mut buf);
       assert_eq!(d.len(), 3);
       drop(d);
@@ -981,8 +980,7 @@ mod tests {
       for _ in 0..4 {
         p.enqueue(DropCounter).unwrap();
       }
-      let mut buf: [MaybeUninit<DropCounter>; 4] =
-        unsafe { MaybeUninit::uninit().assume_init() };
+      let mut buf: [MaybeUninit<DropCounter>; 4] = unsafe { MaybeUninit::uninit().assume_init() };
       let d = c.dequeue_batch(&mut buf);
       let mut it = d.into_iter();
       drop(it.next().unwrap());
