@@ -639,17 +639,6 @@ const _: () = {
 mod tests {
   use super::*;
 
-  static DROPS: AtomicUsize = AtomicUsize::new(0);
-
-  #[derive(Debug)]
-  struct DropCounter;
-
-  impl Drop for DropCounter {
-    fn drop(&mut self) {
-      DROPS.fetch_add(1, Ordering::SeqCst);
-    }
-  }
-
   mod producer {
     use super::*;
 
@@ -806,49 +795,70 @@ mod tests {
 
     #[test]
     fn drop_walks_unconsumed() {
-      super::DROPS.store(0, Ordering::SeqCst);
-      {
-        let mut ring = SpscRing::<super::DropCounter, 4>::new();
-        let (mut p, _c) = ring.split();
-        p.enqueue(super::DropCounter).unwrap();
-        p.enqueue(super::DropCounter).unwrap();
-        p.enqueue(super::DropCounter).unwrap();
+      static DROPS: AtomicUsize = AtomicUsize::new(0);
+      #[derive(Debug)]
+      struct DropCounter;
+      impl Drop for DropCounter {
+        fn drop(&mut self) {
+          DROPS.fetch_add(1, Ordering::SeqCst);
+        }
       }
-      assert_eq!(super::DROPS.load(Ordering::SeqCst), 3);
+      {
+        let mut ring = SpscRing::<DropCounter, 4>::new();
+        let (mut p, _c) = ring.split();
+        p.enqueue(DropCounter).unwrap();
+        p.enqueue(DropCounter).unwrap();
+        p.enqueue(DropCounter).unwrap();
+      }
+      assert_eq!(DROPS.load(Ordering::SeqCst), 3);
     }
 
     #[test]
     fn drop_walks_after_partial_drain() {
-      super::DROPS.store(0, Ordering::SeqCst);
+      static DROPS: AtomicUsize = AtomicUsize::new(0);
+      #[derive(Debug)]
+      struct DropCounter;
+      impl Drop for DropCounter {
+        fn drop(&mut self) {
+          DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+      }
       {
-        let mut ring = SpscRing::<super::DropCounter, 4>::new();
+        let mut ring = SpscRing::<DropCounter, 4>::new();
         let (mut p, mut c) = ring.split();
         for _ in 0..4 {
-          p.enqueue(super::DropCounter).unwrap();
+          p.enqueue(DropCounter).unwrap();
         }
         c.dequeue().unwrap();
         c.dequeue().unwrap();
       }
-      assert_eq!(super::DROPS.load(Ordering::SeqCst), 4);
+      assert_eq!(DROPS.load(Ordering::SeqCst), 4);
     }
 
     #[test]
     fn drop_walks_across_slot_wrap() {
-      super::DROPS.store(0, Ordering::SeqCst);
+      static DROPS: AtomicUsize = AtomicUsize::new(0);
+      #[derive(Debug)]
+      struct DropCounter;
+      impl Drop for DropCounter {
+        fn drop(&mut self) {
+          DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+      }
       {
-        let mut ring = SpscRing::<super::DropCounter, 4>::new();
+        let mut ring = SpscRing::<DropCounter, 4>::new();
         let (mut p, mut c) = ring.split();
         for _ in 0..4 {
-          p.enqueue(super::DropCounter).unwrap();
+          p.enqueue(DropCounter).unwrap();
         }
         for _ in 0..3 {
           c.dequeue().unwrap();
         }
         for _ in 0..3 {
-          p.enqueue(super::DropCounter).unwrap();
+          p.enqueue(DropCounter).unwrap();
         }
       }
-      assert_eq!(super::DROPS.load(Ordering::SeqCst), 7);
+      assert_eq!(DROPS.load(Ordering::SeqCst), 7);
     }
   }
 
@@ -888,18 +898,25 @@ mod tests {
 
     #[test]
     fn drop_drops_all_items() {
-      super::DROPS.store(0, Ordering::SeqCst);
-      let mut ring = SpscRing::<super::DropCounter, 4>::new();
+      static DROPS: AtomicUsize = AtomicUsize::new(0);
+      #[derive(Debug)]
+      struct DropCounter;
+      impl Drop for DropCounter {
+        fn drop(&mut self) {
+          DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+      }
+      let mut ring = SpscRing::<DropCounter, 4>::new();
       let (mut p, mut c) = ring.split();
       for _ in 0..3 {
-        p.enqueue(super::DropCounter).unwrap();
+        p.enqueue(DropCounter).unwrap();
       }
-      let mut buf: [MaybeUninit<super::DropCounter>; 3] =
+      let mut buf: [MaybeUninit<DropCounter>; 3] =
         unsafe { MaybeUninit::uninit().assume_init() };
       let d = c.dequeue_batch(&mut buf);
       assert_eq!(d.len(), 3);
       drop(d);
-      assert_eq!(super::DROPS.load(Ordering::SeqCst), 3);
+      assert_eq!(DROPS.load(Ordering::SeqCst), 3);
     }
   }
 
@@ -951,20 +968,27 @@ mod tests {
 
     #[test]
     fn drop_drops_remaining() {
-      super::DROPS.store(0, Ordering::SeqCst);
-      let mut ring = SpscRing::<super::DropCounter, 4>::new();
+      static DROPS: AtomicUsize = AtomicUsize::new(0);
+      #[derive(Debug)]
+      struct DropCounter;
+      impl Drop for DropCounter {
+        fn drop(&mut self) {
+          DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+      }
+      let mut ring = SpscRing::<DropCounter, 4>::new();
       let (mut p, mut c) = ring.split();
       for _ in 0..4 {
-        p.enqueue(super::DropCounter).unwrap();
+        p.enqueue(DropCounter).unwrap();
       }
-      let mut buf: [MaybeUninit<super::DropCounter>; 4] =
+      let mut buf: [MaybeUninit<DropCounter>; 4] =
         unsafe { MaybeUninit::uninit().assume_init() };
       let d = c.dequeue_batch(&mut buf);
       let mut it = d.into_iter();
       drop(it.next().unwrap());
       drop(it.next().unwrap());
       drop(it);
-      assert_eq!(super::DROPS.load(Ordering::SeqCst), 4);
+      assert_eq!(DROPS.load(Ordering::SeqCst), 4);
     }
   }
 }
