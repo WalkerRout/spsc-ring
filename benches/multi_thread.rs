@@ -13,7 +13,7 @@ use lib_spsc_ring::SpscRing;
 fn run_stream<const N: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
   group.bench_function(BenchmarkId::from_parameter(N), |b| {
     b.iter_custom(|iters| {
-      let mut ring = SpscRing::<u64, N>::new();
+      let ring: &'static mut SpscRing<u64, N> = Box::leak(Box::new(SpscRing::new()));
       let (mut producer, mut consumer) = ring.split();
 
       let prefill = (N / 2).min(N - 1);

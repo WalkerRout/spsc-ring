@@ -2,8 +2,10 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::marker::PhantomData;
-use core::mem::{self, MaybeUninit};
+use core::mem::{self, ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut, Index};
+use core::ptr;
+use core::slice;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "heap")]
@@ -40,6 +42,18 @@ impl<T, const N: usize> Producer<'_, T, N> {
   }
 
   #[inline(always)]
+  pub fn enqueue_batch(&mut self, items: &[T]) -> usize
+  where
+    T: Copy,
+  {
+    #[cfg(feature = "padded-handles")]
+    let inner = &mut *self.inner;
+    #[cfg(not(feature = "padded-handles"))]
+    let inner = &mut self.inner;
+    inner.ring.enqueue_batch(items, &mut inner.cached_tail)
+  }
+
+  #[inline(always)]
   pub fn is_full(&self) -> bool {
     is_full(self.inner.ring)
   }
@@ -72,8 +86,159 @@ impl<T, const N: usize> Consumer<'_, T, N> {
   }
 
   #[inline(always)]
+  pub fn dequeue_batch<'a>(&mut self, dst: &'a mut [MaybeUninit<T>]) -> Dequeued<'a, T> {
+    #[cfg(feature = "padded-handles")]
+    let inner = &mut *self.inner;
+    #[cfg(not(feature = "padded-handles"))]
+    let inner = &mut self.inner;
+    let len = inner.ring.dequeue_batch(dst, &mut inner.cached_head);
+    // we provide a helper for consumers, since i dont feel like making a dst: &mut [T]
+    // version of this function... deal with it...
+    Dequeued { buf: dst, len }
+  }
+
+  #[inline(always)]
   pub fn is_empty(&self) -> bool {
     is_empty(self.inner.ring)
+  }
+}
+
+pub struct Dequeued<'a, T> {
+  // <=buf.len(), represents number of successfully dequeued elements
+  len: usize,
+  buf: &'a mut [MaybeUninit<T>],
+}
+
+impl<'a, T> Dequeued<'a, T> {
+  #[inline(always)]
+  pub fn len(&self) -> usize {
+    self.len
+  }
+
+  #[inline(always)]
+  pub fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  #[inline(always)]
+  pub fn as_slice(&self) -> &[T] {
+    unsafe { slice::from_raw_parts(self.buf.as_ptr().cast::<T>(), self.len) }
+  }
+
+  #[inline(always)]
+  pub fn as_mut_slice(&mut self) -> &mut [T] {
+    unsafe { slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<T>(), self.len) }
+  }
+}
+
+impl<T> Drop for Dequeued<'_, T> {
+  #[inline]
+  fn drop(&mut self) {
+    for i in 0..self.len {
+      // safety; can only be constructed with valid elements 0..len, so these are all live
+      unsafe {
+        self.buf[i].assume_init_drop();
+      }
+    }
+  }
+}
+
+impl<T> Deref for Dequeued<'_, T> {
+  type Target = [T];
+
+  #[inline(always)]
+  fn deref(&self) -> &Self::Target {
+    self.as_slice()
+  }
+}
+
+impl<T> DerefMut for Dequeued<'_, T> {
+  #[inline(always)]
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    self.as_mut_slice()
+  }
+}
+
+impl<'a, T> IntoIterator for Dequeued<'a, T> {
+  type Item = T;
+  type IntoIter = DequeuedIntoIter<'a, T>;
+
+  #[inline(always)]
+  fn into_iter(self) -> Self::IntoIter {
+    // we steal ownership out of self; we dont want to clear the memory we are taking...
+    let this = ManuallyDrop::new(self);
+    // cant move non-copy out of &T/&mut T and thats all manuallydrop gives us... so
+    // we steal the buffer...
+    // safety; buffer is alive for lifetime 'a, and we have sole ownership
+    let buf = unsafe { ptr::read(&this.buf) };
+    DequeuedIntoIter {
+      buf,
+      front: 0,
+      back: this.len,
+    }
+  }
+}
+
+pub struct DequeuedIntoIter<'a, T> {
+  // we store a front and back cause we have enough info for a double ended iterator
+  front: usize,
+  back: usize,
+  buf: &'a mut [MaybeUninit<T>],
+}
+
+impl<T> Iterator for DequeuedIntoIter<'_, T> {
+  type Item = T;
+
+  #[inline(always)]
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.front == self.back {
+      return None;
+    }
+    let i = self.front;
+    // walk forwards
+    self.front += 1;
+    // safety; all those elements in [front, back) are valid by construction
+    Some(unsafe { self.buf[i].assume_init_read() })
+  }
+
+  #[inline(always)]
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    let len = self.back - self.front;
+    (len, Some(len))
+  }
+}
+
+impl<T> DoubleEndedIterator for DequeuedIntoIter<'_, T> {
+  #[inline(always)]
+  fn next_back(&mut self) -> Option<Self::Item> {
+    if self.front == self.back {
+      return None;
+    }
+    // step backwards
+    self.back -= 1;
+    // safety; all those elements in [front, back) are valid by construction
+    Some(unsafe { self.buf[self.back].assume_init_read() })
+  }
+}
+
+impl<T> ExactSizeIterator for DequeuedIntoIter<'_, T> {
+  #[inline(always)]
+  fn len(&self) -> usize {
+    self.back - self.front
+  }
+}
+
+impl<T> Drop for DequeuedIntoIter<'_, T> {
+  #[inline]
+  fn drop(&mut self) {
+    while self.front != self.back {
+      // safety; same thing as dequeued::drop, we have exclusive ownership over these
+      // valid elements
+      unsafe {
+        self.buf[self.front].assume_init_drop();
+      }
+      self.front += 1;
+    }
   }
 }
 
@@ -118,21 +283,20 @@ const _: () = {
   }
 };
 
-#[cfg(feature = "padded-slots")]
-struct Slot<T>(CachePadded<UnsafeCell<MaybeUninit<T>>>);
-
-#[cfg(not(feature = "padded-slots"))]
-struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
+struct Slot<T> {
+  #[cfg(feature = "padded-slots")]
+  entry: CachePadded<UnsafeCell<MaybeUninit<T>>>,
+  #[cfg(not(feature = "padded-slots"))]
+  entry: UnsafeCell<MaybeUninit<T>>,
+}
 
 impl<T> Slot<T> {
   fn new() -> Self {
-    #[cfg(feature = "padded-slots")]
-    {
-      Self(CachePadded(UnsafeCell::new(MaybeUninit::uninit())))
-    }
-    #[cfg(not(feature = "padded-slots"))]
-    {
-      Self(UnsafeCell::new(MaybeUninit::uninit()))
+    Self {
+      #[cfg(feature = "padded-slots")]
+      entry: CachePadded(UnsafeCell::new(MaybeUninit::uninit())),
+      #[cfg(not(feature = "padded-slots"))]
+      entry: UnsafeCell::new(MaybeUninit::uninit()),
     }
   }
 }
@@ -141,14 +305,13 @@ impl<T> Deref for Slot<T> {
   type Target = UnsafeCell<MaybeUninit<T>>;
 
   fn deref(&self) -> &Self::Target {
-    // lol
     #[cfg(feature = "padded-slots")]
     {
-      &self.0.0
+      &self.entry.0
     }
     #[cfg(not(feature = "padded-slots"))]
     {
-      &self.0
+      &self.entry
     }
   }
 }
@@ -366,6 +529,53 @@ impl<T, const N: usize> SpscRing<T, N> {
     self.tail.store(tail.wrapping_add(1), Ordering::Release);
     Ok(elem)
   }
+
+  #[inline]
+  fn enqueue_batch(&self, items: &[T], cached_tail: &mut usize) -> usize
+  where
+    T: Copy,
+  {
+    let head = self.head.load(Ordering::Relaxed);
+    let mut room = N - head.wrapping_sub(*cached_tail);
+    if room < items.len() {
+      // double check, we might have more slots available...
+      *cached_tail = self.tail.load(Ordering::Acquire);
+      room = N - head.wrapping_sub(*cached_tail);
+    }
+    let n = items.len().min(room);
+    for (i, &item) in items.iter().take(n).enumerate() {
+      // safety; we calculate possible room in the buffer above
+      unsafe {
+        (*self.ring[head.wrapping_add(i)].get()).write(item);
+      }
+    }
+    if n > 0 {
+      // we only broadcast if anything actually happened...
+      self.head.store(head.wrapping_add(n), Ordering::Release);
+    }
+    n
+  }
+
+  #[inline]
+  fn dequeue_batch(&self, dst: &mut [MaybeUninit<T>], cached_head: &mut usize) -> usize {
+    let tail = self.tail.load(Ordering::Relaxed);
+    let mut available = cached_head.wrapping_sub(tail);
+    if available < dst.len() {
+      // double check, since we might have more room...
+      *cached_head = self.head.load(Ordering::Acquire);
+      available = cached_head.wrapping_sub(tail);
+    }
+    let n = dst.len().min(available);
+    for (i, slot) in dst.iter_mut().take(n).enumerate() {
+      // safety; we calculate possible room in the buffer above
+      let elem = unsafe { (*self.ring[tail.wrapping_add(i)].get()).assume_init_read() };
+      slot.write(elem);
+    }
+    if n > 0 {
+      self.tail.store(tail.wrapping_add(n), Ordering::Release);
+    }
+    n
+  }
 }
 
 // only meaningful when called by consumer (owns tail)
@@ -409,6 +619,8 @@ impl<T, const N: usize> Drop for SpscRing<T, N> {
   }
 }
 
+// safety; our public api enforces single producer, single consumer architecture
+// and we use atomic operations internally to ensure synchronization between threads
 unsafe impl<T, const N: usize> Send for SpscRing<T, N> where T: Send {}
 unsafe impl<T, const N: usize> Sync for SpscRing<T, N> where T: Send {}
 
