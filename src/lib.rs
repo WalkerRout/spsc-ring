@@ -16,6 +16,9 @@ use alloc::{boxed::Box, vec::Vec};
 
 struct ProducerInner<'r, T, const N: usize> {
   ring: &'r SpscRing<T, N>,
+  // own cursor cached locally; we own head, so this matches self.ring.head after every
+  // successful enqueue and we never need to Relaxed-load our own atomic
+  cached_head: usize,
   // we can push until we hit head, so cache the latest goal post, and when we
   // hit it, we can reload to see if its moved...
   cached_tail: usize,
@@ -43,7 +46,9 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
   #[inline(always)]
   pub fn enqueue(&mut self, elem: T) -> Result<(), T> {
     let inner = self.inner_mut();
-    inner.ring.enqueue(elem, &mut inner.cached_tail)
+    inner
+      .ring
+      .enqueue(elem, &mut inner.cached_head, &mut inner.cached_tail)
   }
 
   // might be cool if we return some struct Enqueued that lets us write into
@@ -55,7 +60,9 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
     I: IntoIterator<Item = T>,
   {
     let inner = self.inner_mut();
-    inner.ring.enqueue_batch(items, &mut inner.cached_tail)
+    inner
+      .ring
+      .enqueue_batch(items, &mut inner.cached_head, &mut inner.cached_tail)
   }
 
   #[inline(always)]
@@ -64,7 +71,9 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
     T: Copy,
   {
     let inner = self.inner_mut();
-    inner.ring.enqueue_batch_copy(items, &mut inner.cached_tail)
+    inner
+      .ring
+      .enqueue_batch_copy(items, &mut inner.cached_head, &mut inner.cached_tail)
   }
 
   #[inline(always)]
@@ -75,6 +84,9 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
 
 struct ConsumerInner<'r, T, const N: usize> {
   ring: &'r SpscRing<T, N>,
+  // own cursor cached locally; we own tail, so this matches self.ring.tail after every
+  // successful dequeue and we never need to Relaxed-load our own atomic
+  cached_tail: usize,
   // same shit as producer
   cached_head: usize,
   // enforce !Sync
@@ -101,13 +113,17 @@ impl<'r, T, const N: usize> Consumer<'r, T, N> {
   #[inline(always)]
   pub fn dequeue(&mut self) -> Result<T, Error> {
     let inner = self.inner_mut();
-    inner.ring.dequeue(&mut inner.cached_head)
+    inner
+      .ring
+      .dequeue(&mut inner.cached_tail, &mut inner.cached_head)
   }
 
   #[inline(always)]
   pub fn dequeue_batch<'a>(&mut self, dst: &'a mut [MaybeUninit<T>]) -> Dequeued<'a, T> {
     let inner = self.inner_mut();
-    let len = inner.ring.dequeue_batch(dst, &mut inner.cached_head);
+    let len = inner
+      .ring
+      .dequeue_batch(dst, &mut inner.cached_tail, &mut inner.cached_head);
     Dequeued { buf: dst, len }
   }
 
@@ -418,6 +434,7 @@ pub enum Error {
   QueueIsEmpty,
 }
 
+#[repr(transparent)]
 struct Ring<T, const N: usize> {
   #[cfg(feature = "heap")]
   slots: Box<[Slot<T>; N]>,
@@ -560,6 +577,7 @@ impl<T, const N: usize> SpscRing<T, N> {
   pub fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
     let pinner = ProducerInner {
       ring: self,
+      cached_head: self.head.load(Ordering::Relaxed),
       cached_tail: self.tail.load(Ordering::Relaxed),
       _unsync: PhantomData,
     };
@@ -571,6 +589,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     };
     let cinner = ConsumerInner {
       ring: self,
+      cached_tail: self.tail.load(Ordering::Relaxed),
       cached_head: self.head.load(Ordering::Relaxed),
       _unsync: PhantomData,
     };
@@ -584,6 +603,8 @@ impl<T, const N: usize> SpscRing<T, N> {
   }
 
   // head is owned by the producer
+  // - cached_head matches self.head after every successful enqueue, so we never need
+  //   a Relaxed-load of our own atomic on the hot path
   // - cached_tail is refreshed when producers view of count reaches N
   // - tail only grows, so producers view (head-cached_tail) is always >= the actual
   //   count (head-actual_tail)
@@ -591,9 +612,8 @@ impl<T, const N: usize> SpscRing<T, N> {
   //   - if its ==N, we might not have room and we need to check again...
   //   - it can never be >N, since we check if its ==N before incrementing...
   #[inline]
-  fn enqueue(&self, elem: T, cached_tail: &mut usize) -> Result<(), T> {
-    // producer owns head, we are reading our own writes...
-    let head = self.head.load(Ordering::Relaxed);
+  fn enqueue(&self, elem: T, cached_head: &mut usize, cached_tail: &mut usize) -> Result<(), T> {
+    let head = *cached_head;
     if head.wrapping_sub(*cached_tail) == N {
       // synchronize-with consumer
       *cached_tail = self.tail.load(Ordering::Acquire);
@@ -606,18 +626,21 @@ impl<T, const N: usize> SpscRing<T, N> {
     unsafe {
       (*self.ring[head].get()).write(elem);
     }
-    self.head.store(head.wrapping_add(1), Ordering::Release);
+    let new_head = head.wrapping_add(1);
+    self.head.store(new_head, Ordering::Release);
+    *cached_head = new_head;
     Ok(())
   }
 
   // tail is owned by consumer
+  // - cached_tail matches self.tail after every successful dequeue, so we never need
+  //   a Relaxed-load of our own atomic on the hot path
   // - cached_head is refreshed when tail catches up to head (its empty), to see if
   //   anything else was added in the meantime...
   // - wanted signature to be -> Result<T, ()> but clippy got mad
   #[inline]
-  fn dequeue(&self, cached_head: &mut usize) -> Result<T, Error> {
-    // consumer owns tail, again we are reading our own writes
-    let tail = self.tail.load(Ordering::Relaxed);
+  fn dequeue(&self, cached_tail: &mut usize, cached_head: &mut usize) -> Result<T, Error> {
+    let tail = *cached_tail;
     // did we catch up to the head?
     if tail == *cached_head {
       // yup, synchronize-with producer
@@ -631,16 +654,18 @@ impl<T, const N: usize> SpscRing<T, N> {
     // safety; previous tail slot is treated as garbage after we step the tail, so
     // we can claim sole ownership of the contained element
     let elem = unsafe { (*self.ring[tail].get()).assume_init_read() };
-    self.tail.store(tail.wrapping_add(1), Ordering::Release);
+    let new_tail = tail.wrapping_add(1);
+    self.tail.store(new_tail, Ordering::Release);
+    *cached_tail = new_tail;
     Ok(elem)
   }
 
   #[inline]
-  fn enqueue_batch<I>(&self, items: I, cached_tail: &mut usize) -> usize
+  fn enqueue_batch<I>(&self, items: I, cached_head: &mut usize, cached_tail: &mut usize) -> usize
   where
     I: IntoIterator<Item = T>,
   {
-    let head = self.head.load(Ordering::Relaxed);
+    let head = *cached_head;
     let mut room = N - head.wrapping_sub(*cached_tail);
     if room == 0 {
       *cached_tail = self.tail.load(Ordering::Acquire);
@@ -655,24 +680,33 @@ impl<T, const N: usize> SpscRing<T, N> {
     // autovectorizes better with two loops, state flag in chain fought compiler
     'outer: for slots in [first, second] {
       for slot in slots {
-        let Some(item) = items.next() else { break 'outer };
+        let Some(item) = items.next() else {
+          break 'outer;
+        };
         // safety; slot is in [head, head+room) which is exclusively ours to write
         unsafe { (*slot.get()).write(item) };
         n += 1;
       }
     }
     if n > 0 {
-      self.head.store(head.wrapping_add(n), Ordering::Release);
+      let new_head = head.wrapping_add(n);
+      self.head.store(new_head, Ordering::Release);
+      *cached_head = new_head;
     }
     n
   }
 
   #[inline]
-  fn enqueue_batch_copy(&self, items: &[T], cached_tail: &mut usize) -> usize
+  fn enqueue_batch_copy(
+    &self,
+    items: &[T],
+    cached_head: &mut usize,
+    cached_tail: &mut usize,
+  ) -> usize
   where
     T: Copy,
   {
-    let head = self.head.load(Ordering::Relaxed);
+    let head = *cached_head;
     let mut room = N - head.wrapping_sub(*cached_tail);
     if room < items.len() {
       *cached_tail = self.tail.load(Ordering::Acquire);
@@ -682,14 +716,21 @@ impl<T, const N: usize> SpscRing<T, N> {
     if n > 0 {
       // safety; we hold exclusive write access to slots [head, head+n)
       unsafe { self.ring.write_copy(head & (N - 1), &items[..n]) };
-      self.head.store(head.wrapping_add(n), Ordering::Release);
+      let new_head = head.wrapping_add(n);
+      self.head.store(new_head, Ordering::Release);
+      *cached_head = new_head;
     }
     n
   }
 
   #[inline]
-  fn dequeue_batch(&self, dst: &mut [MaybeUninit<T>], cached_head: &mut usize) -> usize {
-    let tail = self.tail.load(Ordering::Relaxed);
+  fn dequeue_batch(
+    &self,
+    dst: &mut [MaybeUninit<T>],
+    cached_tail: &mut usize,
+    cached_head: &mut usize,
+  ) -> usize {
+    let tail = *cached_tail;
     let mut available = cached_head.wrapping_sub(tail);
     if available < dst.len() {
       *cached_head = self.head.load(Ordering::Acquire);
@@ -699,7 +740,9 @@ impl<T, const N: usize> SpscRing<T, N> {
     if n > 0 {
       // safety; slots [tail, tail+n) are initialized and exclusively ours to read
       unsafe { self.ring.read_into(tail & (N - 1), &mut dst[..n]) };
-      self.tail.store(tail.wrapping_add(n), Ordering::Release);
+      let new_tail = tail.wrapping_add(n);
+      self.tail.store(new_tail, Ordering::Release);
+      *cached_tail = new_tail;
     }
     n
   }
