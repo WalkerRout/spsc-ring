@@ -31,26 +31,37 @@ pub struct Producer<'r, T, const N: usize> {
   inner: ProducerInner<'r, T, N>,
 }
 
-impl<T, const N: usize> Producer<'_, T, N> {
+impl<'r, T, const N: usize> Producer<'r, T, N> {
+  #[inline(always)]
+  fn inner_mut(&mut self) -> &mut ProducerInner<'r, T, N> {
+    #[cfg(feature = "padded-handles")]
+    return &mut *self.inner;
+    #[cfg(not(feature = "padded-handles"))]
+    return &mut self.inner;
+  }
+
   #[inline(always)]
   pub fn enqueue(&mut self, elem: T) -> Result<(), T> {
-    #[cfg(feature = "padded-handles")]
-    let inner = &mut *self.inner;
-    #[cfg(not(feature = "padded-handles"))]
-    let inner = &mut self.inner;
+    let inner = self.inner_mut();
     inner.ring.enqueue(elem, &mut inner.cached_tail)
   }
 
   #[inline(always)]
-  pub fn enqueue_batch(&mut self, items: &[T]) -> usize
+  pub fn enqueue_batch<I>(&mut self, items: I) -> usize
+  where
+    I: IntoIterator<Item = T>,
+  {
+    let inner = self.inner_mut();
+    inner.ring.enqueue_batch(items, &mut inner.cached_tail)
+  }
+
+  #[inline(always)]
+  pub fn enqueue_batch_copy(&mut self, items: &[T]) -> usize
   where
     T: Copy,
   {
-    #[cfg(feature = "padded-handles")]
-    let inner = &mut *self.inner;
-    #[cfg(not(feature = "padded-handles"))]
-    let inner = &mut self.inner;
-    inner.ring.enqueue_batch(items, &mut inner.cached_tail)
+    let inner = self.inner_mut();
+    inner.ring.enqueue_batch_copy(items, &mut inner.cached_tail)
   }
 
   #[inline(always)]
@@ -75,26 +86,40 @@ pub struct Consumer<'r, T, const N: usize> {
   inner: ConsumerInner<'r, T, N>,
 }
 
-impl<T, const N: usize> Consumer<'_, T, N> {
+impl<'r, T, const N: usize> Consumer<'r, T, N> {
+  #[inline(always)]
+  fn inner_mut(&mut self) -> &mut ConsumerInner<'r, T, N> {
+    #[cfg(feature = "padded-handles")]
+    return &mut *self.inner;
+    #[cfg(not(feature = "padded-handles"))]
+    return &mut self.inner;
+  }
+
   #[inline(always)]
   pub fn dequeue(&mut self) -> Result<T, Error> {
-    #[cfg(feature = "padded-handles")]
-    let inner = &mut *self.inner;
-    #[cfg(not(feature = "padded-handles"))]
-    let inner = &mut self.inner;
+    let inner = self.inner_mut();
     inner.ring.dequeue(&mut inner.cached_head)
   }
 
   #[inline(always)]
   pub fn dequeue_batch<'a>(&mut self, dst: &'a mut [MaybeUninit<T>]) -> Dequeued<'a, T> {
-    #[cfg(feature = "padded-handles")]
-    let inner = &mut *self.inner;
-    #[cfg(not(feature = "padded-handles"))]
-    let inner = &mut self.inner;
+    let inner = self.inner_mut();
     let len = inner.ring.dequeue_batch(dst, &mut inner.cached_head);
-    // we provide a helper for consumers, since i dont feel like making a dst: &mut [T]
-    // version of this function... deal with it...
     Dequeued { buf: dst, len }
+  }
+
+  // wrapper around dequeue_batch for copy types, since we can basically treat them the same
+  // way as maybeuninit types...
+  #[inline(always)]
+  pub fn dequeue_batch_copy<'a>(&mut self, dst: &'a mut [T]) -> Dequeued<'a, T>
+  where
+    T: Copy,
+  {
+    // safety; T is copy, so we sorta treat it as plain old data... we can just overwrite it
+    // or drop it or whatever and it doesnt care...
+    let dst_uninit: &'a mut [MaybeUninit<T>] =
+      unsafe { slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<MaybeUninit<T>>(), dst.len()) };
+    self.dequeue_batch(dst_uninit)
   }
 
   #[inline(always)]
@@ -122,11 +147,13 @@ impl<'a, T> Dequeued<'a, T> {
 
   #[inline(always)]
   pub fn as_slice(&self) -> &[T] {
+    // safety; we exclusively own buf and [0, len) is alive
     unsafe { slice::from_raw_parts(self.buf.as_ptr().cast::<T>(), self.len) }
   }
 
   #[inline(always)]
   pub fn as_mut_slice(&mut self) -> &mut [T] {
+    // safety; we exclusively own buf and [0, len) is alive
     unsafe { slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<T>(), self.len) }
   }
 }
@@ -283,6 +310,7 @@ const _: () = {
   }
 };
 
+#[repr(transparent)]
 struct Slot<T> {
   #[cfg(feature = "padded-slots")]
   entry: CachePadded<UnsafeCell<MaybeUninit<T>>>,
@@ -291,7 +319,11 @@ struct Slot<T> {
 }
 
 impl<T> Slot<T> {
-  fn new() -> Self {
+  const COMPACT: bool = mem::size_of::<Self>() == mem::size_of::<MaybeUninit<T>>();
+}
+
+impl<T> Default for Slot<T> {
+  fn default() -> Self {
     Self {
       #[cfg(feature = "padded-slots")]
       entry: CachePadded(UnsafeCell::new(MaybeUninit::uninit())),
@@ -403,7 +435,7 @@ impl<T, const N: usize> Ring<T, N> {
     #[cfg(feature = "heap")]
     let slots = {
       (0..N)
-        .map(|_| Slot::new())
+        .map(|_| Slot::default())
         .collect::<Vec<_>>()
         .into_boxed_slice()
         .try_into()
@@ -414,9 +446,79 @@ impl<T, const N: usize> Ring<T, N> {
     #[cfg(not(feature = "heap"))]
     let slots = {
       use core::array;
-      array::from_fn(|_| Slot::new())
+      array::from_fn(|_| Slot::default())
     };
     Self { slots }
+  }
+
+  #[inline(always)]
+  fn chunks(&self, start: usize, n: usize) -> (&[Slot<T>], &[Slot<T>]) {
+    let first_len = n.min(N - start);
+    let second_len = n - first_len;
+    (
+      &self.slots[start..start + first_len],
+      &self.slots[..second_len],
+    )
+  }
+
+  // safety; caller has exclusive write access to slots [start..start+items.len())
+  #[inline]
+  unsafe fn write_copy(&self, start: usize, items: &[T])
+  where
+    T: Copy,
+  {
+    let (first, second) = self.chunks(start, items.len());
+    if Slot::<T>::COMPACT {
+      // safety; slot slices are layout compatible
+      // - we do two memcpys... i dont like that, but it works...
+      // - todo for specialized targets, we could mmap the same physical pages at adjacent
+      //   virtual addresses, and then have the page table transparently handle wrap
+      //   around... im feeling lazy, so im saving this for a later date...
+      //   - https://fgiesen.wordpress.com/2012/07/21/the-magic-ring-buffer/
+      //   - https://andreleite.com/posts/2025/nstl/virtual-memory-ring-buffer/
+      //   - https://www.reachablecode.com/2022/11/22/a-doubly-mmapped-contiguous-shared-memory-lock-free-queue/
+      unsafe {
+        ptr::copy_nonoverlapping(items.as_ptr(), first.as_ptr() as *mut T, first.len());
+        ptr::copy_nonoverlapping(
+          items.as_ptr().add(first.len()),
+          second.as_ptr() as *mut T,
+          second.len(),
+        );
+      }
+    } else {
+      for (slot, &item) in first.iter().chain(second).zip(items) {
+        // safety; no other thread can read this slot while we publish
+        unsafe { (*slot.get()).write(item) };
+      }
+    }
+  }
+
+  // safety; caller has exclusive read access to slots [start..start+dst.len())
+  // and those slots are alive
+  #[inline]
+  unsafe fn read_into(&self, start: usize, dst: &mut [MaybeUninit<T>]) {
+    let (first, second) = self.chunks(start, dst.len());
+    if Slot::<T>::COMPACT {
+      // safety; slot slices are layout compatible...
+      unsafe {
+        ptr::copy_nonoverlapping(
+          first.as_ptr() as *const T,
+          dst.as_mut_ptr().cast::<T>(),
+          first.len(),
+        );
+        ptr::copy_nonoverlapping(
+          second.as_ptr() as *const T,
+          dst.as_mut_ptr().add(first.len()).cast::<T>(),
+          second.len(),
+        );
+      }
+    } else {
+      for (slot, out) in first.iter().chain(second).zip(dst.iter_mut()) {
+        // safety; slot is initialized and treated as garbage after being drained
+        let elem = unsafe { (*slot.get()).assume_init_read() };
+        out.write(elem);
+      }
+    }
   }
 }
 
@@ -458,16 +560,16 @@ impl<T, const N: usize> SpscRing<T, N> {
       cached_tail: self.tail.load(Ordering::Relaxed),
       _unsync: PhantomData,
     };
-    let cinner = ConsumerInner {
-      ring: self,
-      cached_head: self.head.load(Ordering::Relaxed),
-      _unsync: PhantomData,
-    };
     let producer = Producer {
       #[cfg(feature = "padded-handles")]
       inner: CachePadded(pinner),
       #[cfg(not(feature = "padded-handles"))]
       inner: pinner,
+    };
+    let cinner = ConsumerInner {
+      ring: self,
+      cached_head: self.head.load(Ordering::Relaxed),
+      _unsync: PhantomData,
     };
     let consumer = Consumer {
       #[cfg(feature = "padded-handles")]
@@ -531,26 +633,49 @@ impl<T, const N: usize> SpscRing<T, N> {
   }
 
   #[inline]
-  fn enqueue_batch(&self, items: &[T], cached_tail: &mut usize) -> usize
+  fn enqueue_batch<I>(&self, items: I, cached_tail: &mut usize) -> usize
+  where
+    I: IntoIterator<Item = T>,
+  {
+    let head = self.head.load(Ordering::Relaxed);
+    let mut room = N - head.wrapping_sub(*cached_tail);
+    if room == 0 {
+      *cached_tail = self.tail.load(Ordering::Acquire);
+      room = N - head.wrapping_sub(*cached_tail);
+      if room == 0 {
+        return 0;
+      }
+    }
+    let (first, second) = self.ring.chunks(head & (N - 1), room);
+    let mut items = items.into_iter();
+    let mut n = 0;
+    for slot in first.iter().chain(second) {
+      let Some(item) = items.next() else { break };
+      // safety; slot is in [head, head+room) which is exclusively ours to write
+      unsafe { (*slot.get()).write(item) };
+      n += 1;
+    }
+    if n > 0 {
+      self.head.store(head.wrapping_add(n), Ordering::Release);
+    }
+    n
+  }
+
+  #[inline]
+  fn enqueue_batch_copy(&self, items: &[T], cached_tail: &mut usize) -> usize
   where
     T: Copy,
   {
     let head = self.head.load(Ordering::Relaxed);
     let mut room = N - head.wrapping_sub(*cached_tail);
     if room < items.len() {
-      // double check, we might have more slots available...
       *cached_tail = self.tail.load(Ordering::Acquire);
       room = N - head.wrapping_sub(*cached_tail);
     }
     let n = items.len().min(room);
-    for (i, &item) in items.iter().take(n).enumerate() {
-      // safety; we calculate possible room in the buffer above
-      unsafe {
-        (*self.ring[head.wrapping_add(i)].get()).write(item);
-      }
-    }
     if n > 0 {
-      // we only broadcast if anything actually happened...
+      // safety; we hold exclusive write access to slots [head, head+n)
+      unsafe { self.ring.write_copy(head & (N - 1), &items[..n]) };
       self.head.store(head.wrapping_add(n), Ordering::Release);
     }
     n
@@ -561,17 +686,13 @@ impl<T, const N: usize> SpscRing<T, N> {
     let tail = self.tail.load(Ordering::Relaxed);
     let mut available = cached_head.wrapping_sub(tail);
     if available < dst.len() {
-      // double check, since we might have more room...
       *cached_head = self.head.load(Ordering::Acquire);
       available = cached_head.wrapping_sub(tail);
     }
     let n = dst.len().min(available);
-    for (i, slot) in dst.iter_mut().take(n).enumerate() {
-      // safety; we calculate possible room in the buffer above
-      let elem = unsafe { (*self.ring[tail.wrapping_add(i)].get()).assume_init_read() };
-      slot.write(elem);
-    }
     if n > 0 {
+      // safety; slots [tail, tail+n) are initialized and exclusively ours to read
+      unsafe { self.ring.read_into(tail & (N - 1), &mut dst[..n]) };
       self.tail.store(tail.wrapping_add(n), Ordering::Release);
     }
     n
@@ -605,15 +726,13 @@ impl<T, const N: usize> Default for SpscRing<T, N> {
 impl<T, const N: usize> Drop for SpscRing<T, N> {
   fn drop(&mut self) {
     if mem::needs_drop::<T>() {
-      // tail is racing to catch up to head
-      let mut tail = self.tail.load(Ordering::Relaxed);
+      let tail = self.tail.load(Ordering::Relaxed);
       let head = self.head.load(Ordering::Relaxed);
-      while tail != head {
+      let n = head.wrapping_sub(tail);
+      let (first, second) = self.ring.chunks(tail & (N - 1), n);
+      for slot in first.iter().chain(second) {
         // safety; all elements between tail and head are uniquely owned and live
-        unsafe {
-          (*self.ring[tail].get()).assume_init_drop();
-        }
-        tail = tail.wrapping_add(1);
+        unsafe { (*slot.get()).assume_init_drop() };
       }
     }
   }
@@ -662,24 +781,61 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_batch_fits() {
+    fn enqueue_batch_copy_fits() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, _c) = ring.split();
-      assert_eq!(p.enqueue_batch(&[1, 2, 3]), 3);
+      assert_eq!(p.enqueue_batch_copy(&[1, 2, 3]), 3);
     }
 
     #[test]
-    fn enqueue_batch_partial() {
+    fn enqueue_batch_copy_partial() {
       let mut ring = SpscRing::<u32, 4>::new();
       let (mut p, _c) = ring.split();
-      assert_eq!(p.enqueue_batch(&[1, 2, 3, 4, 5, 6]), 4);
+      assert_eq!(p.enqueue_batch_copy(&[1, 2, 3, 4, 5, 6]), 4);
     }
 
     #[test]
-    fn enqueue_batch_empty() {
+    fn enqueue_batch_copy_empty() {
       let mut ring = SpscRing::<u32, 4>::new();
       let (mut p, _c) = ring.split();
-      assert_eq!(p.enqueue_batch(&[]), 0);
+      assert_eq!(p.enqueue_batch_copy(&[]), 0);
+    }
+
+    #[test]
+    fn enqueue_batch_copy_wraps_slot_indices() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, mut c) = ring.split();
+      assert_eq!(p.enqueue_batch_copy(&[1, 2, 3]), 3);
+      assert_eq!(c.dequeue().unwrap(), 1);
+      assert_eq!(c.dequeue().unwrap(), 2);
+      assert_eq!(p.enqueue_batch_copy(&[4, 5, 6]), 3);
+      assert_eq!(c.dequeue().unwrap(), 3);
+      assert_eq!(c.dequeue().unwrap(), 4);
+      assert_eq!(c.dequeue().unwrap(), 5);
+      assert_eq!(c.dequeue().unwrap(), 6);
+    }
+
+    #[test]
+    fn enqueue_batch_consumes_iter_when_fits() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, _c) = ring.split();
+      assert_eq!(p.enqueue_batch([1u32, 2, 3]), 3);
+    }
+
+    #[test]
+    fn enqueue_batch_fills_what_fits() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, _c) = ring.split();
+      assert_eq!(p.enqueue_batch([1u32, 2, 3, 4, 5, 6]), 4);
+    }
+
+    #[test]
+    fn enqueue_batch_leaves_unconsumed_in_borrowed_iter() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, _c) = ring.split();
+      let mut iter = [1u32, 2, 3, 4, 5, 6, 7].into_iter();
+      assert_eq!(p.enqueue_batch(iter.by_ref()), 4);
+      assert_eq!(iter.next(), Some(5));
     }
 
     #[test]
@@ -716,7 +872,7 @@ mod tests {
     fn dequeue_batch() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-      p.enqueue_batch(&[1, 2, 3, 4]);
+      p.enqueue_batch_copy(&[1, 2, 3, 4]);
       let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
       let d = c.dequeue_batch(&mut buf);
       assert_eq!(d.len(), 4);
@@ -727,7 +883,7 @@ mod tests {
     fn dequeue_batch_partial() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-      p.enqueue_batch(&[1, 2]);
+      p.enqueue_batch_copy(&[1, 2]);
       let mut buf: [MaybeUninit<u32>; 5] = [MaybeUninit::uninit(); 5];
       let d = c.dequeue_batch(&mut buf);
       assert_eq!(d.len(), 2);
@@ -742,6 +898,35 @@ mod tests {
       let d = c.dequeue_batch(&mut buf);
       assert_eq!(d.len(), 0);
       assert!(d.is_empty());
+    }
+
+    #[test]
+    fn dequeue_batch_copy() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch_copy(&[10, 20, 30, 40]);
+      let mut buf = [0u32; 4];
+      let d = c.dequeue_batch_copy(&mut buf);
+      assert_eq!(d.len(), 4);
+      assert_eq!(d.as_slice(), &[10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn dequeue_batch_copy_wraps_slot_indices() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch_copy(&[1, 2, 3]);
+      let mut buf = [0u32; 2];
+      {
+        let d = c.dequeue_batch_copy(&mut buf);
+        assert_eq!(d.len(), 2);
+        assert_eq!(d.as_slice(), &[1, 2]);
+      }
+      p.enqueue_batch_copy(&[4, 5, 6]);
+      let mut buf = [0u32; 4];
+      let d = c.dequeue_batch_copy(&mut buf);
+      assert_eq!(d.len(), 4);
+      assert_eq!(d.as_slice(), &[3, 4, 5, 6]);
     }
 
     #[test]
@@ -869,7 +1054,7 @@ mod tests {
     fn len_matches_dequeued() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-      p.enqueue_batch(&[1, 2, 3]);
+      p.enqueue_batch_copy(&[1, 2, 3]);
       let mut buf: [MaybeUninit<u32>; 8] = [MaybeUninit::uninit(); 8];
       let d = c.dequeue_batch(&mut buf);
       assert_eq!(d.len(), 3);
@@ -879,7 +1064,7 @@ mod tests {
     fn as_slice_yields_items_in_order() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-      p.enqueue_batch(&[10, 20, 30, 40]);
+      p.enqueue_batch_copy(&[10, 20, 30, 40]);
       let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
       let d = c.dequeue_batch(&mut buf);
       assert_eq!(d.as_slice(), &[10, 20, 30, 40]);
@@ -889,7 +1074,7 @@ mod tests {
     fn deref_to_slice() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-      p.enqueue_batch(&[1, 2, 3]);
+      p.enqueue_batch_copy(&[1, 2, 3]);
       let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
       let d = c.dequeue_batch(&mut buf);
       let sum: u32 = d.iter().sum();
@@ -926,7 +1111,7 @@ mod tests {
     fn yields_in_order() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-      p.enqueue_batch(&[100, 101, 102]);
+      p.enqueue_batch_copy(&[100, 101, 102]);
       let mut buf: [MaybeUninit<u32>; 3] = [MaybeUninit::uninit(); 3];
       let d = c.dequeue_batch(&mut buf);
       let mut it = d.into_iter();
@@ -940,7 +1125,7 @@ mod tests {
     fn next_back_reverses() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-      p.enqueue_batch(&[1, 2, 3]);
+      p.enqueue_batch_copy(&[1, 2, 3]);
       let mut buf: [MaybeUninit<u32>; 3] = [MaybeUninit::uninit(); 3];
       let d = c.dequeue_batch(&mut buf);
       let mut it = d.into_iter();
@@ -954,7 +1139,7 @@ mod tests {
     fn exact_size_iterator_len() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-      p.enqueue_batch(&[1, 2, 3, 4]);
+      p.enqueue_batch_copy(&[1, 2, 3, 4]);
       let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
       let d = c.dequeue_batch(&mut buf);
       let mut it = d.into_iter();
