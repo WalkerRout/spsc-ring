@@ -634,3 +634,341 @@ const _: () = {
     assert::<SpscRing<T, N>>();
   }
 };
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+  #[derive(Debug)]
+  struct DropCounter;
+
+  impl Drop for DropCounter {
+    fn drop(&mut self) {
+      DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  mod producer {
+    use super::*;
+
+    #[test]
+    fn enqueue() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, _c) = ring.split();
+      assert!(p.enqueue(1).is_ok());
+      assert!(p.enqueue(2).is_ok());
+      assert!(p.enqueue(3).is_ok());
+      assert!(p.enqueue(4).is_ok());
+    }
+
+    #[test]
+    fn enqueue_full_returns_value() {
+      let mut ring = SpscRing::<u32, 2>::new();
+      let (mut p, _c) = ring.split();
+      p.enqueue(10).unwrap();
+      p.enqueue(20).unwrap();
+      assert_eq!(p.enqueue(30), Err(30));
+    }
+
+    #[test]
+    fn enqueue_batch_fits() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, _c) = ring.split();
+      assert_eq!(p.enqueue_batch(&[1, 2, 3]), 3);
+    }
+
+    #[test]
+    fn enqueue_batch_partial() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, _c) = ring.split();
+      assert_eq!(p.enqueue_batch(&[1, 2, 3, 4, 5, 6]), 4);
+    }
+
+    #[test]
+    fn enqueue_batch_empty() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, _c) = ring.split();
+      assert_eq!(p.enqueue_batch(&[]), 0);
+    }
+
+    #[test]
+    fn is_full() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, _c) = ring.split();
+      assert!(!p.is_full());
+      for i in 0..4 {
+        p.enqueue(i).unwrap();
+      }
+      assert!(p.is_full());
+    }
+  }
+
+  mod consumer {
+    use super::*;
+
+    #[test]
+    fn dequeue() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue(42).unwrap();
+      assert_eq!(c.dequeue().unwrap(), 42);
+    }
+
+    #[test]
+    fn dequeue_empty_returns_err() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (_p, mut c) = ring.split();
+      assert!(c.dequeue().is_err());
+    }
+
+    #[test]
+    fn dequeue_batch() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch(&[1, 2, 3, 4]);
+      let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+      let d = c.dequeue_batch(&mut buf);
+      assert_eq!(d.len(), 4);
+      assert_eq!(d.as_slice(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn dequeue_batch_partial() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch(&[1, 2]);
+      let mut buf: [MaybeUninit<u32>; 5] = [MaybeUninit::uninit(); 5];
+      let d = c.dequeue_batch(&mut buf);
+      assert_eq!(d.len(), 2);
+      assert_eq!(d.as_slice(), &[1, 2]);
+    }
+
+    #[test]
+    fn dequeue_batch_empty_queue() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (_p, mut c) = ring.split();
+      let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+      let d = c.dequeue_batch(&mut buf);
+      assert_eq!(d.len(), 0);
+      assert!(d.is_empty());
+    }
+
+    #[test]
+    fn is_empty() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, c) = ring.split();
+      assert!(c.is_empty());
+      p.enqueue(1).unwrap();
+      assert!(!c.is_empty());
+    }
+  }
+
+  mod spsc_ring {
+    use super::*;
+
+    #[test]
+    fn capacity_n_items() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, _c) = ring.split();
+      for i in 0..4 {
+        p.enqueue(i).unwrap();
+      }
+      assert_eq!(p.enqueue(99), Err(99));
+    }
+
+    #[test]
+    fn capacity_minimum() {
+      let mut ring = SpscRing::<u32, 2>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue(1).unwrap();
+      p.enqueue(2).unwrap();
+      assert_eq!(p.enqueue(3), Err(3));
+      assert_eq!(c.dequeue().unwrap(), 1);
+      assert_eq!(c.dequeue().unwrap(), 2);
+      assert!(c.dequeue().is_err());
+    }
+
+    #[test]
+    fn fifo_order() {
+      let mut ring = SpscRing::<u32, 4>::new();
+      let (mut p, mut c) = ring.split();
+      for cycle in 0..100u32 {
+        for i in 0..4 {
+          p.enqueue(cycle * 10 + i).unwrap();
+        }
+        for i in 0..4 {
+          assert_eq!(c.dequeue().unwrap(), cycle * 10 + i);
+        }
+      }
+    }
+
+    #[test]
+    fn drop_walks_unconsumed() {
+      super::DROPS.store(0, Ordering::SeqCst);
+      {
+        let mut ring = SpscRing::<super::DropCounter, 4>::new();
+        let (mut p, _c) = ring.split();
+        p.enqueue(super::DropCounter).unwrap();
+        p.enqueue(super::DropCounter).unwrap();
+        p.enqueue(super::DropCounter).unwrap();
+      }
+      assert_eq!(super::DROPS.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn drop_walks_after_partial_drain() {
+      super::DROPS.store(0, Ordering::SeqCst);
+      {
+        let mut ring = SpscRing::<super::DropCounter, 4>::new();
+        let (mut p, mut c) = ring.split();
+        for _ in 0..4 {
+          p.enqueue(super::DropCounter).unwrap();
+        }
+        c.dequeue().unwrap();
+        c.dequeue().unwrap();
+      }
+      assert_eq!(super::DROPS.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn drop_walks_across_slot_wrap() {
+      super::DROPS.store(0, Ordering::SeqCst);
+      {
+        let mut ring = SpscRing::<super::DropCounter, 4>::new();
+        let (mut p, mut c) = ring.split();
+        for _ in 0..4 {
+          p.enqueue(super::DropCounter).unwrap();
+        }
+        for _ in 0..3 {
+          c.dequeue().unwrap();
+        }
+        for _ in 0..3 {
+          p.enqueue(super::DropCounter).unwrap();
+        }
+      }
+      assert_eq!(super::DROPS.load(Ordering::SeqCst), 7);
+    }
+  }
+
+  mod dequeued {
+    use super::*;
+
+    #[test]
+    fn len_matches_dequeued() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch(&[1, 2, 3]);
+      let mut buf: [MaybeUninit<u32>; 8] = [MaybeUninit::uninit(); 8];
+      let d = c.dequeue_batch(&mut buf);
+      assert_eq!(d.len(), 3);
+    }
+
+    #[test]
+    fn as_slice_yields_items_in_order() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch(&[10, 20, 30, 40]);
+      let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+      let d = c.dequeue_batch(&mut buf);
+      assert_eq!(d.as_slice(), &[10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn deref_to_slice() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch(&[1, 2, 3]);
+      let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+      let d = c.dequeue_batch(&mut buf);
+      let sum: u32 = d.iter().sum();
+      assert_eq!(sum, 6);
+    }
+
+    #[test]
+    fn drop_drops_all_items() {
+      super::DROPS.store(0, Ordering::SeqCst);
+      let mut ring = SpscRing::<super::DropCounter, 4>::new();
+      let (mut p, mut c) = ring.split();
+      for _ in 0..3 {
+        p.enqueue(super::DropCounter).unwrap();
+      }
+      let mut buf: [MaybeUninit<super::DropCounter>; 3] =
+        unsafe { MaybeUninit::uninit().assume_init() };
+      let d = c.dequeue_batch(&mut buf);
+      assert_eq!(d.len(), 3);
+      drop(d);
+      assert_eq!(super::DROPS.load(Ordering::SeqCst), 3);
+    }
+  }
+
+  mod dequeued_into_iter {
+    use super::*;
+
+    #[test]
+    fn yields_in_order() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch(&[100, 101, 102]);
+      let mut buf: [MaybeUninit<u32>; 3] = [MaybeUninit::uninit(); 3];
+      let d = c.dequeue_batch(&mut buf);
+      let collected: [u32; 3] = [
+        {
+          let mut it = d.into_iter();
+          it.next().unwrap()
+        },
+        100,
+        101,
+      ];
+      let _ = collected;
+    }
+
+    #[test]
+    fn next_back_reverses() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch(&[1, 2, 3]);
+      let mut buf: [MaybeUninit<u32>; 3] = [MaybeUninit::uninit(); 3];
+      let d = c.dequeue_batch(&mut buf);
+      let mut it = d.into_iter();
+      assert_eq!(it.next_back(), Some(3));
+      assert_eq!(it.next(), Some(1));
+      assert_eq!(it.next_back(), Some(2));
+      assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn exact_size_iterator_len() {
+      let mut ring = SpscRing::<u32, 8>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_batch(&[1, 2, 3, 4]);
+      let mut buf: [MaybeUninit<u32>; 4] = [MaybeUninit::uninit(); 4];
+      let d = c.dequeue_batch(&mut buf);
+      let mut it = d.into_iter();
+      assert_eq!(it.len(), 4);
+      it.next();
+      assert_eq!(it.len(), 3);
+      it.next_back();
+      assert_eq!(it.len(), 2);
+    }
+
+    #[test]
+    fn drop_drops_remaining() {
+      super::DROPS.store(0, Ordering::SeqCst);
+      let mut ring = SpscRing::<super::DropCounter, 4>::new();
+      let (mut p, mut c) = ring.split();
+      for _ in 0..4 {
+        p.enqueue(super::DropCounter).unwrap();
+      }
+      let mut buf: [MaybeUninit<super::DropCounter>; 4] =
+        unsafe { MaybeUninit::uninit().assume_init() };
+      let d = c.dequeue_batch(&mut buf);
+      let mut it = d.into_iter();
+      drop(it.next().unwrap());
+      drop(it.next().unwrap());
+      drop(it);
+      assert_eq!(super::DROPS.load(Ordering::SeqCst), 4);
+    }
+  }
+}
