@@ -910,13 +910,10 @@ mod tests {
     fn yields_in_order() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
-
       p.enqueue_batch(&[100, 101, 102]);
-
       let mut buf: [MaybeUninit<u32>; 3] = [MaybeUninit::uninit(); 3];
       let d = c.dequeue_batch(&mut buf);
       let mut it = d.into_iter();
-
       assert_eq!(it.next(), Some(100));
       assert_eq!(it.next(), Some(101));
       assert_eq!(it.next(), Some(102));
