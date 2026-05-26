@@ -46,6 +46,9 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
     inner.ring.enqueue(elem, &mut inner.cached_tail)
   }
 
+  // might be cool if we return some struct Enqueued that lets us write into
+  // the maybeuninit slots themselves, and then commit those writes into the
+  // ring buffer...
   #[inline(always)]
   pub fn enqueue_batch<I>(&mut self, items: I) -> usize
   where
@@ -649,11 +652,14 @@ impl<T, const N: usize> SpscRing<T, N> {
     let (first, second) = self.ring.chunks(head & (N - 1), room);
     let mut items = items.into_iter();
     let mut n = 0;
-    for slot in first.iter().chain(second) {
-      let Some(item) = items.next() else { break };
-      // safety; slot is in [head, head+room) which is exclusively ours to write
-      unsafe { (*slot.get()).write(item) };
-      n += 1;
+    // autovectorizes better with two loops, state flag in chain fought compiler
+    'outer: for slots in [first, second] {
+      for slot in slots {
+        let Some(item) = items.next() else { break 'outer };
+        // safety; slot is in [head, head+room) which is exclusively ours to write
+        unsafe { (*slot.get()).write(item) };
+        n += 1;
+      }
     }
     if n > 0 {
       self.head.store(head.wrapping_add(n), Ordering::Release);
