@@ -470,6 +470,13 @@ impl<T, const N: usize> Ring<T, N> {
     let (first, second) = self.chunks(start, items.len());
     if Slot::<T>::COMPACT {
       // safety; slot slices are layout compatible
+      // - we do two memcpys... i dont like that, but it works...
+      // - todo for specialized targets, we could mmap the same physical pages at adjacent
+      //   virtual addresses, and then have the page table transparently handle wrap
+      //   around... im feeling lazy, so im saving this for a later date...
+      //   - https://fgiesen.wordpress.com/2012/07/21/the-magic-ring-buffer/
+      //   - https://andreleite.com/posts/2025/nstl/virtual-memory-ring-buffer/
+      //   - https://www.reachablecode.com/2022/11/22/a-doubly-mmapped-contiguous-shared-memory-lock-free-queue/
       unsafe {
         ptr::copy_nonoverlapping(items.as_ptr(), first.as_ptr() as *mut T, first.len());
         ptr::copy_nonoverlapping(
