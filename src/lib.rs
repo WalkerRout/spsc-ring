@@ -267,8 +267,11 @@ impl<T, const N: usize> Index<usize> for Ring<T, N> {
 }
 
 /// Lock-free, single-producer single-consumer ring buffer
-/// - contains N-1 available slots, SpscRing<T, 16>
 pub struct SpscRing<T, const N: usize> {
+  // head and tail are monotonic; we only care about the difference between them,
+  // not the values themselves... this means we can use whatever numbers we want
+  // (modulo N) to act as our representation, s.t. we only ever need to increment
+  // and wrap around...
   head: CachePadded<AtomicUsize>,
   tail: CachePadded<AtomicUsize>,
   ring: Ring<T, N>,
@@ -313,17 +316,20 @@ impl<T, const N: usize> SpscRing<T, N> {
   }
 
   // head is owned by the producer
-  // - cached_tail is refreshed when head catches back around to tail... this means
-  //   the queue is full, and we need to check to see if the tail has moved forward
+  // - cached_tail is refreshed when producers view of count reaches N
+  // - tail only grows, so producers view (head-cached_tail) is always >= the actual
+  //   count (head-actual_tail)
+  // - we check the count (head-cached_tail) and if its <N, we have room...
+  //   - if its ==N, we might not have room and we need to check again...
+  //   - it can never be >N, since we check if its ==N before incrementing...
   #[inline]
   fn enqueue(&self, elem: T, cached_tail: &mut usize) -> Result<(), T> {
     // producer owns head, we are reading our own writes...
     let head = self.head.load(Ordering::Relaxed);
-    let next_head = step::<N>(head);
-    if next_head == *cached_tail {
+    if head.wrapping_sub(*cached_tail) == N {
       // synchronize-with consumer
       *cached_tail = self.tail.load(Ordering::Acquire);
-      if next_head == *cached_tail {
+      if head.wrapping_sub(*cached_tail) == N {
         return Err(elem);
       }
     }
@@ -332,7 +338,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     unsafe {
       (*self.ring[head].get()).write(elem);
     }
-    self.head.store(next_head, Ordering::Release);
+    self.head.store(head.wrapping_add(1), Ordering::Release);
     Ok(())
   }
 
@@ -357,8 +363,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     // safety; previous tail slot is treated as garbage after we step the tail, so
     // we can claim sole ownership of the contained element
     let elem = unsafe { (*self.ring[tail].get()).assume_init_read() };
-    let next_tail = step::<N>(tail);
-    self.tail.store(next_tail, Ordering::Release);
+    self.tail.store(tail.wrapping_add(1), Ordering::Release);
     Ok(elem)
   }
 }
@@ -378,13 +383,7 @@ fn is_full<T, const N: usize>(ring: &SpscRing<T, N>) -> bool {
   // synchronize-with consumer
   let tail = ring.tail.load(Ordering::Acquire);
   let head = ring.head.load(Ordering::Relaxed);
-  let next_head = step::<N>(head);
-  next_head == tail
-}
-
-#[inline(always)]
-fn step<const N: usize>(i: usize) -> usize {
-  (i + 1) & (N - 1)
+  head.wrapping_sub(tail) == N
 }
 
 impl<T, const N: usize> Default for SpscRing<T, N> {
@@ -404,7 +403,7 @@ impl<T, const N: usize> Drop for SpscRing<T, N> {
         unsafe {
           (*self.ring[tail].get()).assume_init_drop();
         }
-        tail = step::<N>(tail);
+        tail = tail.wrapping_add(1);
       }
     }
   }
