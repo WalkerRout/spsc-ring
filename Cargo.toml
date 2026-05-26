@@ -23,6 +23,6 @@ criterion = "0.5"
 
 [features]
 default = []
+heap = []
 padded-slots = []
 padded-handles = []
-heap = []

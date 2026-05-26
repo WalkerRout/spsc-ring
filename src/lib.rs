@@ -441,8 +441,8 @@ pub struct SpscRing<T, const N: usize> {
 }
 
 impl<T, const N: usize> SpscRing<T, N> {
-  #[must_use]
   #[inline]
+  #[must_use]
   pub fn new() -> Self {
     Self {
       head: CachePadded(AtomicUsize::new(0)),
@@ -910,18 +910,17 @@ mod tests {
     fn yields_in_order() {
       let mut ring = SpscRing::<u32, 8>::new();
       let (mut p, mut c) = ring.split();
+
       p.enqueue_batch(&[100, 101, 102]);
+
       let mut buf: [MaybeUninit<u32>; 3] = [MaybeUninit::uninit(); 3];
       let d = c.dequeue_batch(&mut buf);
-      let collected: [u32; 3] = [
-        {
-          let mut it = d.into_iter();
-          it.next().unwrap()
-        },
-        100,
-        101,
-      ];
-      let _ = collected;
+      let mut it = d.into_iter();
+
+      assert_eq!(it.next(), Some(100));
+      assert_eq!(it.next(), Some(101));
+      assert_eq!(it.next(), Some(102));
+      assert_eq!(it.next(), None);
     }
 
     #[test]
