@@ -669,6 +669,26 @@ impl<T, const N: usize> SpscRing<T, N> {
     // safety; previous tail slot is treated as garbage after we step the tail, so
     // we can claim sole ownership of the contained element
     let elem = unsafe { (*self.ring[tail].get()).assume_init_read() };
+    // consumer polls on empty, which invalidates producers head atomic...
+    // - slowing the consumers success path slows its polling rate, reducing cross
+    //   core coherence pressure on heads cache line
+    //   - producer writes to head, enters modified state
+    //   - consumer sees cached state as empty -> reads head (enters shared state),
+    //     producer copy becomes shared
+    //   - next time producer goes to write to head, needs to read-for-ownership to
+    //     enter modified state, and everything repeats...
+    #[cfg(feature = "consumer-spread")]
+    {
+      use core::hint;
+      let mut x = tail;
+      for _ in 0..7 {
+        // we want alu ops that arent factored out; spsc-ring codegen is very lean,
+        // so we introduce artificial latency behind a feature gate...
+        // this should only be used for high-throughput, polled/busy waited workloads
+        x = hint::black_box(x.wrapping_mul(0x100000001b3));
+      }
+      hint::black_box(x);
+    }
     let new_tail = tail.wrapping_add(1);
     self.tail.store(new_tail, Ordering::Release);
     *cached_tail = new_tail;
