@@ -3,6 +3,10 @@ name = "lib-spsc-ring"
 version = "0.1.0"
 edition = "2024"
 
+# we dont include benchmarks in build
+[lib]
+bench = false
+
 [[example]]
 name = "sequence"
 path = "examples/sequence.rs"
@@ -26,3 +30,7 @@ default = []
 heap = []
 padded-slots = []
 padded-handles = []
+
+[profile.bench]
+lto = true
+codegen-units = 1
