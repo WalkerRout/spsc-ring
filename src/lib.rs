@@ -516,7 +516,7 @@ impl<T, const N: usize> Ring<T, N> {
     T: Copy,
   {
     let (first, second) = self.chunks(start, items.len());
-    if Slot::<T>::COMPACT {
+    if const { Slot::<T>::COMPACT } {
       // safety; slot slices are layout compatible
       // - we do two memcpys... i dont like that, but it works...
       // - todo for specialized targets, we could mmap the same physical pages at adjacent
