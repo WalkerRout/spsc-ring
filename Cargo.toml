@@ -42,3 +42,7 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
+[lints.clippy]
+nursery = { level = "deny" }
+pedantic = { level = "deny" }
+enum_glob_use = { level = "deny" }

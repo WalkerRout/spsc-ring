@@ -1,4 +1,6 @@
 #![no_std]
+#![allow(clippy::inline_always)]
+#![allow(clippy::missing_errors_doc)]
 
 use core::cell::{Cell, UnsafeCell};
 use core::marker::PhantomData;
@@ -35,10 +37,12 @@ pub struct Producer<'r, T, const N: usize> {
 }
 
 impl<'r, T, const N: usize> Producer<'r, T, N> {
+  // constness varies with padded-handles feature (deref-mut isnt const)
   #[inline(always)]
+  #[allow(clippy::missing_const_for_fn)]
   fn inner_mut(&mut self) -> &mut ProducerInner<'r, T, N> {
     #[cfg(feature = "padded-handles")]
-    return &mut *self.inner;
+    return &mut self.inner;
     #[cfg(not(feature = "padded-handles"))]
     return &mut self.inner;
   }
@@ -86,6 +90,7 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
     n
   }
 
+  #[must_use]
   #[inline(always)]
   pub fn is_full(&self) -> bool {
     is_full(self.inner.ring)
@@ -112,10 +117,14 @@ pub struct Consumer<'r, T, const N: usize> {
 }
 
 impl<'r, T, const N: usize> Consumer<'r, T, N> {
+  // cant use const, derefmut is not a const fn
   #[inline(always)]
+  #[allow(clippy::missing_const_for_fn)]
   fn inner_mut(&mut self) -> &mut ConsumerInner<'r, T, N> {
+    // i am aware these feature gates are redundant, but they are semantically
+    // useful...
     #[cfg(feature = "padded-handles")]
-    return &mut *self.inner;
+    return &mut self.inner;
     #[cfg(not(feature = "padded-handles"))]
     return &mut self.inner;
   }
@@ -156,6 +165,7 @@ impl<'r, T, const N: usize> Consumer<'r, T, N> {
     self.dequeue_batch(dst_uninit)
   }
 
+  #[must_use]
   #[inline(always)]
   pub fn is_empty(&self) -> bool {
     is_empty(self.inner.ring)
@@ -168,25 +178,28 @@ pub struct Dequeued<'a, T> {
   buf: &'a mut [MaybeUninit<T>],
 }
 
-impl<'a, T> Dequeued<'a, T> {
+impl<T> Dequeued<'_, T> {
+  #[must_use]
   #[inline(always)]
-  pub fn len(&self) -> usize {
+  pub const fn len(&self) -> usize {
     self.len
   }
 
+  #[must_use]
   #[inline(always)]
-  pub fn is_empty(&self) -> bool {
+  pub const fn is_empty(&self) -> bool {
     self.len == 0
   }
 
+  #[must_use]
   #[inline(always)]
-  pub fn as_slice(&self) -> &[T] {
+  pub const fn as_slice(&self) -> &[T] {
     // safety; we exclusively own buf and [0, len) is alive
     unsafe { slice::from_raw_parts(self.buf.as_ptr().cast::<T>(), self.len) }
   }
 
   #[inline(always)]
-  pub fn as_mut_slice(&mut self) -> &mut [T] {
+  pub const fn as_mut_slice(&mut self) -> &mut [T] {
     // safety; we exclusively own buf and [0, len) is alive
     unsafe { slice::from_raw_parts_mut(self.buf.as_mut_ptr().cast::<T>(), self.len) }
   }
@@ -231,7 +244,7 @@ impl<'a, T> IntoIterator for Dequeued<'a, T> {
     // cant move non-copy out of &T/&mut T and thats all manuallydrop gives us... so
     // we steal the buffer...
     // safety; buffer is alive for lifetime 'a, and we have sole ownership
-    let buf = unsafe { ptr::read(&this.buf) };
+    let buf = unsafe { ptr::read(&raw const this.buf) };
     DequeuedIntoIter {
       buf,
       front: 0,
@@ -307,7 +320,7 @@ impl<T> Drop for DequeuedIntoIter<'_, T> {
 const _: () = {
   #[allow(unused)]
   fn check<T: Send, const N: usize>() {
-    fn assert<X: Send>() {}
+    const fn assert<X: Send>() {}
     assert::<Producer<T, N>>();
     assert::<Consumer<T, N>>();
   }
@@ -513,10 +526,14 @@ impl<T, const N: usize> Ring<T, N> {
       //   - https://andreleite.com/posts/2025/nstl/virtual-memory-ring-buffer/
       //   - https://www.reachablecode.com/2022/11/22/a-doubly-mmapped-contiguous-shared-memory-lock-free-queue/
       unsafe {
-        ptr::copy_nonoverlapping(items.as_ptr(), first.as_ptr() as *mut T, first.len());
+        ptr::copy_nonoverlapping(
+          items.as_ptr(),
+          first.as_ptr().cast::<T>().cast_mut(),
+          first.len(),
+        );
         ptr::copy_nonoverlapping(
           items.as_ptr().add(first.len()),
-          second.as_ptr() as *mut T,
+          second.as_ptr().cast::<T>().cast_mut(),
           second.len(),
         );
       }
@@ -537,12 +554,12 @@ impl<T, const N: usize> Ring<T, N> {
       // safety; slot slices are layout compatible...
       unsafe {
         ptr::copy_nonoverlapping(
-          first.as_ptr() as *const T,
+          first.as_ptr().cast::<T>(),
           dst.as_mut_ptr().cast::<T>(),
           first.len(),
         );
         ptr::copy_nonoverlapping(
-          second.as_ptr() as *const T,
+          second.as_ptr().cast::<T>(),
           dst.as_mut_ptr().add(first.len()).cast::<T>(),
           second.len(),
         );
@@ -685,7 +702,7 @@ impl<T, const N: usize> SpscRing<T, N> {
         // we want alu ops that arent factored out; spsc-ring codegen is very lean,
         // so we introduce artificial latency behind a feature gate...
         // this should only be used for high-throughput, polled/busy waited workloads
-        x = hint::black_box(x.wrapping_mul(0x100000001b3));
+        x = hint::black_box(x.wrapping_mul(0x100_0000_01b3));
       }
       hint::black_box(x);
     }
@@ -713,6 +730,7 @@ impl<T, const N: usize> SpscRing<T, N> {
     let mut items = items.into_iter();
     let mut n = 0;
     // autovectorizes better with two loops, state flag in chain fought compiler
+    #[allow(clippy::tuple_array_conversions)]
     'outer: for slots in [first, second] {
       for slot in slots {
         let Some(item) = items.next() else {
@@ -833,7 +851,7 @@ const _: () = {
   // so we dont need T: Sync...
   #[allow(unused)]
   fn check<T: Send, const N: usize>() {
-    fn assert<X: Send + Sync>() {}
+    const fn assert<X: Send + Sync>() {}
     assert::<SpscRing<T, N>>();
   }
 };
