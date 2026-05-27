@@ -46,23 +46,30 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
   #[inline(always)]
   pub fn enqueue(&mut self, elem: T) -> Result<(), T> {
     let inner = self.inner_mut();
-    inner
-      .ring
-      .enqueue(elem, &mut inner.cached_head, &mut inner.cached_tail)
+    // copy to locals so llvm can promote to registers; inner ring lives in same alloc
+    // as atomics, so llvm conservatively reloads on each iter
+    let mut head = inner.cached_head;
+    let mut tail = inner.cached_tail;
+    let r = inner.ring.enqueue(elem, &mut head, &mut tail);
+    inner.cached_head = head;
+    inner.cached_tail = tail;
+    r
   }
 
-  // might be cool if we return some struct Enqueued that lets us write into
-  // the maybeuninit slots themselves, and then commit those writes into the
-  // ring buffer...
+  // might be cool if we return some struct Enqueued that lets us write into the maybeuninit
+  // slots themselves, and then commit those writes into the ring buffer...
   #[inline(always)]
   pub fn enqueue_batch<I>(&mut self, items: I) -> usize
   where
     I: IntoIterator<Item = T>,
   {
     let inner = self.inner_mut();
-    inner
-      .ring
-      .enqueue_batch(items, &mut inner.cached_head, &mut inner.cached_tail)
+    let mut head = inner.cached_head;
+    let mut tail = inner.cached_tail;
+    let n = inner.ring.enqueue_batch(items, &mut head, &mut tail);
+    inner.cached_head = head;
+    inner.cached_tail = tail;
+    n
   }
 
   #[inline(always)]
@@ -71,9 +78,12 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
     T: Copy,
   {
     let inner = self.inner_mut();
-    inner
-      .ring
-      .enqueue_batch_copy(items, &mut inner.cached_head, &mut inner.cached_tail)
+    let mut head = inner.cached_head;
+    let mut tail = inner.cached_tail;
+    let n = inner.ring.enqueue_batch_copy(items, &mut head, &mut tail);
+    inner.cached_head = head;
+    inner.cached_tail = tail;
+    n
   }
 
   #[inline(always)]
@@ -113,17 +123,22 @@ impl<'r, T, const N: usize> Consumer<'r, T, N> {
   #[inline(always)]
   pub fn dequeue(&mut self) -> Result<T, Error> {
     let inner = self.inner_mut();
-    inner
-      .ring
-      .dequeue(&mut inner.cached_tail, &mut inner.cached_head)
+    let mut tail = inner.cached_tail;
+    let mut head = inner.cached_head;
+    let r = inner.ring.dequeue(&mut tail, &mut head);
+    inner.cached_tail = tail;
+    inner.cached_head = head;
+    r
   }
 
   #[inline(always)]
   pub fn dequeue_batch<'a>(&mut self, dst: &'a mut [MaybeUninit<T>]) -> Dequeued<'a, T> {
     let inner = self.inner_mut();
-    let len = inner
-      .ring
-      .dequeue_batch(dst, &mut inner.cached_tail, &mut inner.cached_head);
+    let mut tail = inner.cached_tail;
+    let mut head = inner.cached_head;
+    let len = inner.ring.dequeue_batch(dst, &mut tail, &mut head);
+    inner.cached_tail = tail;
+    inner.cached_head = head;
     Dequeued { buf: dst, len }
   }
 
