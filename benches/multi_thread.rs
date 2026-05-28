@@ -31,7 +31,7 @@ fn stream<const N: usize>(b: &mut Bencher<'_>, ring: &mut SpscRing<u64, N>) {
         for i in 0..iters {
           let mut value = black_box(i);
           loop {
-            match producer.enqueue(value) {
+            match producer.enqueue_lazy(value) {
               Ok(()) => break,
               Err(v) => {
                 value = v;
@@ -174,7 +174,7 @@ fn run_stream<const N: usize>(group: &mut BenchmarkGroup<'_, WallTime>) {
     let mut ring = SpscRing::<u64, N>::new();
     stream(b, &mut ring);
   });
-  group.bench_function(BenchmarkId::new("heap", N), |b| {
+  group.bench_function(BenchmarkId::new("boxed", N), |b| {
     let mut ring = Box::new(SpscRing::<u64, N>::new());
     stream(b, &mut ring);
   });

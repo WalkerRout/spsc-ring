@@ -16,11 +16,14 @@ extern crate alloc;
 #[cfg(feature = "heap")]
 use alloc::{boxed::Box, vec::Vec};
 
+const LAZY_PUBLISH_THRESHOLD: usize = 8;
+
 struct ProducerInner<'r, T, const N: usize> {
   ring: &'r SpscRing<T, N>,
   // own cursor cached locally; we own head, so this matches self.ring.head after every
   // successful enqueue and we never need to Relaxed-load our own atomic
   cached_head: usize,
+  published_head: usize,
   // we can push until we hit head, so cache the latest goal post, and when we
   // hit it, we can reload to see if its moved...
   cached_tail: usize,
@@ -56,6 +59,22 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
     let mut tail = inner.cached_tail;
     let r = inner.ring.enqueue(elem, &mut head, &mut tail);
     inner.cached_head = head;
+    inner.published_head = head;
+    inner.cached_tail = tail;
+    r
+  }
+
+  #[inline(always)]
+  pub fn enqueue_lazy(&mut self, elem: T) -> Result<(), T> {
+    let inner = self.inner_mut();
+    let mut head = inner.cached_head;
+    let mut published = inner.published_head;
+    let mut tail = inner.cached_tail;
+    let r = inner
+      .ring
+      .enqueue_lazy(elem, &mut head, &mut published, &mut tail);
+    inner.cached_head = head;
+    inner.published_head = published;
     inner.cached_tail = tail;
     r
   }
@@ -72,6 +91,7 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
     let mut tail = inner.cached_tail;
     let n = inner.ring.enqueue_batch(items, &mut head, &mut tail);
     inner.cached_head = head;
+    inner.published_head = head;
     inner.cached_tail = tail;
     n
   }
@@ -86,14 +106,30 @@ impl<'r, T, const N: usize> Producer<'r, T, N> {
     let mut tail = inner.cached_tail;
     let n = inner.ring.enqueue_batch_copy(items, &mut head, &mut tail);
     inner.cached_head = head;
+    inner.published_head = head;
     inner.cached_tail = tail;
     n
+  }
+
+  #[inline]
+  pub fn flush(&mut self) {
+    let inner = self.inner_mut();
+    if inner.cached_head != inner.published_head {
+      inner.ring.head.store(inner.cached_head, Ordering::Release);
+      inner.published_head = inner.cached_head;
+    }
   }
 
   #[must_use]
   #[inline(always)]
   pub fn is_full(&self) -> bool {
     is_full(self.inner.ring)
+  }
+}
+
+impl<T, const N: usize> Drop for Producer<'_, T, N> {
+  fn drop(&mut self) {
+    self.flush();
   }
 }
 
@@ -365,10 +401,6 @@ struct Slot<T> {
   entry: UnsafeCell<MaybeUninit<T>>,
 }
 
-impl<T> Slot<T> {
-  const COMPACT: bool = mem::size_of::<Self>() == mem::size_of::<MaybeUninit<T>>();
-}
-
 impl<T> Default for Slot<T> {
   fn default() -> Self {
     Self {
@@ -516,7 +548,8 @@ impl<T, const N: usize> Ring<T, N> {
     T: Copy,
   {
     let (first, second) = self.chunks(start, items.len());
-    if const { Slot::<T>::COMPACT } {
+    #[cfg(not(feature = "padded-slots"))]
+    {
       // safety; slot slices are layout compatible
       // - we do two memcpys... i dont like that, but it works...
       // - todo for specialized targets, we could mmap the same physical pages at adjacent
@@ -537,11 +570,11 @@ impl<T, const N: usize> Ring<T, N> {
           second.len(),
         );
       }
-    } else {
-      for (slot, &item) in first.iter().chain(second).zip(items) {
-        // safety; no other thread can read this slot while we publish
-        unsafe { (*slot.get()).write(item) };
-      }
+    }
+    #[cfg(feature = "padded-slots")]
+    for (slot, &item) in first.iter().chain(second).zip(items) {
+      // safety; no other thread can read this slot while we publish
+      unsafe { (*slot.get()).write(item) };
     }
   }
 
@@ -550,7 +583,8 @@ impl<T, const N: usize> Ring<T, N> {
   #[inline]
   unsafe fn read_into(&self, start: usize, dst: &mut [MaybeUninit<T>]) {
     let (first, second) = self.chunks(start, dst.len());
-    if Slot::<T>::COMPACT {
+    #[cfg(not(feature = "padded-slots"))]
+    {
       // safety; slot slices are layout compatible...
       unsafe {
         ptr::copy_nonoverlapping(
@@ -564,12 +598,12 @@ impl<T, const N: usize> Ring<T, N> {
           second.len(),
         );
       }
-    } else {
-      for (slot, out) in first.iter().chain(second).zip(dst.iter_mut()) {
-        // safety; slot is initialized and treated as garbage after being drained
-        let elem = unsafe { (*slot.get()).assume_init_read() };
-        out.write(elem);
-      }
+    }
+    #[cfg(feature = "padded-slots")]
+    for (slot, out) in first.iter().chain(second).zip(dst.iter_mut()) {
+      // safety; slot is initialized and treated as garbage after being drained
+      let elem = unsafe { (*slot.get()).assume_init_read() };
+      out.write(elem);
     }
   }
 }
@@ -607,10 +641,13 @@ impl<T, const N: usize> SpscRing<T, N> {
 
   #[inline]
   pub fn split(&mut self) -> (Producer<'_, T, N>, Consumer<'_, T, N>) {
+    let head0 = self.head.load(Ordering::Relaxed);
+    let tail0 = self.tail.load(Ordering::Relaxed);
     let pinner = ProducerInner {
       ring: self,
-      cached_head: self.head.load(Ordering::Relaxed),
-      cached_tail: self.tail.load(Ordering::Relaxed),
+      cached_head: head0,
+      published_head: head0,
+      cached_tail: tail0,
       _unsync: PhantomData,
     };
     let producer = Producer {
@@ -621,8 +658,8 @@ impl<T, const N: usize> SpscRing<T, N> {
     };
     let cinner = ConsumerInner {
       ring: self,
-      cached_tail: self.tail.load(Ordering::Relaxed),
-      cached_head: self.head.load(Ordering::Relaxed),
+      cached_tail: tail0,
+      cached_head: head0,
       _unsync: PhantomData,
     };
     let consumer = Consumer {
@@ -664,6 +701,38 @@ impl<T, const N: usize> SpscRing<T, N> {
     Ok(())
   }
 
+  #[inline]
+  fn enqueue_lazy(
+    &self,
+    elem: T,
+    cached_head: &mut usize,
+    published_head: &mut usize,
+    cached_tail: &mut usize,
+  ) -> Result<(), T> {
+    let head = *cached_head;
+    if head.wrapping_sub(*cached_tail) == N {
+      if head != *published_head {
+        self.head.store(head, Ordering::Release);
+        *published_head = head;
+      }
+      *cached_tail = self.tail.load(Ordering::Acquire);
+      if head.wrapping_sub(*cached_tail) == N {
+        return Err(elem);
+      }
+    }
+    unsafe {
+      (*self.ring[head].get()).write(elem);
+    }
+    let new_head = head.wrapping_add(1);
+    *cached_head = new_head;
+    let k = N.min(LAZY_PUBLISH_THRESHOLD);
+    if new_head.wrapping_sub(*published_head) >= k {
+      self.head.store(new_head, Ordering::Release);
+      *published_head = new_head;
+    }
+    Ok(())
+  }
+
   // tail is owned by consumer
   // - cached_tail matches self.tail after every successful dequeue, so we never need
   //   a Relaxed-load of our own atomic on the hot path
@@ -686,26 +755,6 @@ impl<T, const N: usize> SpscRing<T, N> {
     // safety; previous tail slot is treated as garbage after we step the tail, so
     // we can claim sole ownership of the contained element
     let elem = unsafe { (*self.ring[tail].get()).assume_init_read() };
-    // consumer polls on empty, which invalidates producers head atomic...
-    // - slowing the consumers success path slows its polling rate, reducing cross
-    //   core coherence pressure on heads cache line
-    //   - producer writes to head, enters modified state
-    //   - consumer sees cached state as empty -> reads head (enters shared state),
-    //     producer copy becomes shared
-    //   - next time producer goes to write to head, needs to read-for-ownership to
-    //     enter modified state, and everything repeats...
-    #[cfg(feature = "consumer-spread")]
-    {
-      use core::hint;
-      let mut x = tail;
-      for _ in 0..7 {
-        // we want alu ops that arent factored out; spsc-ring codegen is very lean,
-        // so we introduce artificial latency behind a feature gate...
-        // this should only be used for high-throughput, polled/busy waited workloads
-        x = hint::black_box(x.wrapping_mul(0x100_0000_01b3));
-      }
-      hint::black_box(x);
-    }
     let new_tail = tail.wrapping_add(1);
     self.tail.store(new_tail, Ordering::Release);
     *cached_tail = new_tail;
@@ -949,6 +998,29 @@ mod tests {
         p.enqueue(i).unwrap();
       }
       assert!(p.is_full());
+    }
+
+    #[test]
+    fn enqueue_lazy_invisible_until_flush() {
+      let mut ring = SpscRing::<u32, 16>::new();
+      let (mut p, mut c) = ring.split();
+      p.enqueue_lazy(1).unwrap();
+      assert!(c.dequeue().is_err());
+      p.flush();
+      assert_eq!(c.dequeue().unwrap(), 1);
+    }
+
+    #[test]
+    fn enqueue_lazy_drop_flushes() {
+      let mut ring = SpscRing::<u32, 16>::new();
+      {
+        let (mut p, _c) = ring.split();
+        p.enqueue_lazy(1).unwrap();
+        p.enqueue_lazy(2).unwrap();
+      }
+      let (_p, mut c) = ring.split();
+      assert_eq!(c.dequeue().unwrap(), 1);
+      assert_eq!(c.dequeue().unwrap(), 2);
     }
   }
 

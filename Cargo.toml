@@ -30,10 +30,6 @@ default = []
 heap = []
 padded-slots = []
 padded-handles = []
-# artificially inserts ~21 cycles of dependent alu work in dequeue success path
-# to slow polling rate; trying to keep cache line for head atomic in modified
-# state on producer between invalidating empty-checks from consumer
-consumer-spread = []
 
 [profile.release]
 lto = true
