@@ -3,6 +3,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 use core::cell::{Cell, UnsafeCell};
+use core::error;
+use core::fmt;
 use core::marker::PhantomData;
 use core::mem::{self, ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut, Index};
@@ -488,11 +490,18 @@ impl<T> DerefMut for CachePadded<T> {
   }
 }
 
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Error {
-  #[error("spsc ring queue is empty")]
   QueueIsEmpty,
 }
+
+impl fmt::Display for Error {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "spsc ring queue is empty")
+  }
+}
+
+impl error::Error for Error {}
 
 #[repr(transparent)]
 struct Ring<T, const N: usize> {
