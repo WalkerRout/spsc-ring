@@ -540,14 +540,19 @@ impl<T, const N: usize> Ring<T, N> {
     Self { slots }
   }
 
+  // safety; caller guarantees start < N and n <= N
   #[inline(always)]
-  fn chunks(&self, start: usize, n: usize) -> (&[Slot<T>], &[Slot<T>]) {
+  unsafe fn chunks_unchecked(&self, start: usize, n: usize) -> (&[Slot<T>], &[Slot<T>]) {
     let first_len = n.min(N - start);
     let second_len = n - first_len;
-    (
-      &self.slots[start..start + first_len],
-      &self.slots[..second_len],
-    )
+    let base = self.slots.as_ptr();
+    // safety; start + first_len <= N and second_len <= N stay inside the array
+    unsafe {
+      (
+        slice::from_raw_parts(base.add(start), first_len),
+        slice::from_raw_parts(base, second_len),
+      )
+    }
   }
 
   // safety; caller has exclusive write access to slots [start..start+items.len())
@@ -556,7 +561,8 @@ impl<T, const N: usize> Ring<T, N> {
   where
     T: Copy,
   {
-    let (first, second) = self.chunks(start, items.len());
+    // safety; start < N and items.len() <= N per this fn's contract
+    let (first, second) = unsafe { self.chunks_unchecked(start, items.len()) };
     #[cfg(not(feature = "padded-slots"))]
     {
       // safety; slot slices are layout compatible
@@ -591,7 +597,8 @@ impl<T, const N: usize> Ring<T, N> {
   // and those slots are alive
   #[inline]
   unsafe fn read_into(&self, start: usize, dst: &mut [MaybeUninit<T>]) {
-    let (first, second) = self.chunks(start, dst.len());
+    // safety; start < N and dst.len() <= N per this fn's contract
+    let (first, second) = unsafe { self.chunks_unchecked(start, dst.len()) };
     #[cfg(not(feature = "padded-slots"))]
     {
       // safety; slot slices are layout compatible...
@@ -784,7 +791,8 @@ impl<T, const N: usize> SpscRing<T, N> {
         return 0;
       }
     }
-    let (first, second) = self.ring.chunks(head & (N - 1), room);
+    // safety; head & (N - 1) < N and room <= N
+    let (first, second) = unsafe { self.ring.chunks_unchecked(head & (N - 1), room) };
     let mut items = items.into_iter();
     let mut n = 0;
     // autovectorizes better with two loops, state flag in chain fought compiler
@@ -889,7 +897,8 @@ impl<T, const N: usize> Drop for SpscRing<T, N> {
       let tail = self.tail.load(Ordering::Relaxed);
       let head = self.head.load(Ordering::Relaxed);
       let n = head.wrapping_sub(tail);
-      let (first, second) = self.ring.chunks(tail & (N - 1), n);
+      // safety; tail & (N - 1) < N and n = head - tail <= N
+      let (first, second) = unsafe { self.ring.chunks_unchecked(tail & (N - 1), n) };
       for slot in first.iter().chain(second) {
         // safety; all elements between tail and head are uniquely owned and live
         unsafe { (*slot.get()).assume_init_drop() };
